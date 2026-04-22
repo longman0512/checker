@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.venv*/
+state.json
+dom_settings.json
+api_settings.json
+login_recipe.json
