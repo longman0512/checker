@@ -4,7 +4,9 @@ __pycache__/
 *.pyd
 .venv/
 .venv*/
+# Runtime/UI state and learned cache files
 state.json
 dom_settings.json
-api_settings.json
+anti_captcha_settings.json
 login_recipe.json
+form_cache.json

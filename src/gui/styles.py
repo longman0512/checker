@@ -121,6 +121,28 @@ def apply_styles(root: tk.Tk) -> dict:
         foreground=[("disabled", PALETTE["muted"])],
     )
 
+    # Checkbuttons (clearer checked/unchecked contrast)
+    style.configure("TCheckbutton",
+        background=PALETTE["bg"],
+        foreground=PALETTE["fg"],
+        font=("Segoe UI", 9, "bold"),
+        padding=(6, 3),
+        indicatorcolor=PALETTE["surface"],
+        indicatormargin=(2, 2, 6, 2),
+    )
+    style.map("TCheckbutton",
+        foreground=[
+            ("selected", PALETTE["green"]),
+            ("!selected", PALETTE["muted"]),
+            ("disabled", PALETTE["disabled"]),
+        ],
+        indicatorcolor=[
+            ("selected", PALETTE["green"]),
+            ("!selected", PALETTE["surface"]),
+        ],
+        background=[("active", PALETTE["bg"])],
+    )
+
     # Entry / Combobox
     style.configure("TEntry",
         fieldbackground=PALETTE["surface"],

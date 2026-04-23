@@ -1,0 +1,162 @@
+{
+  "APIKEY": "sonic_764d2308c738e4ec7651d79bf47eb25ed23f",
+  "ACTIVE": true,
+  "THEME": "light",
+  "TITLES": [
+    "POPULARCAPTCHA",
+    "RECAPTCHA2",
+    "AWSWAF",
+    "BLS",
+    "GEETEST",
+    "MTCAPTCHA",
+    "PROSOPO",
+    "TIKTOK",
+    "CAPTCHAFOX",
+    "BINANCE",
+    "TENCENT"
+  ],
+  "CAPTCHAS": [
+    "POPULARCAPTCHA",
+    "RECAPTCHA2",
+    "AWSWAF",
+    "BLS",
+    "GEETEST",
+    "MTCAPTCHA",
+    "PROSOPO",
+    "TIKTOK",
+    "CAPTCHAFOX",
+    "BINANCE",
+    "TENCENT"
+  ],
+  "BLACKLIST": [
+    "https://github.com"
+  ],
+  "BLACKLISTENABLED": false,
+  "AUTOOPENENABLED": true,
+  "LOGENABLED": true,
+  "Local_lang": "en",
+  "NOTIFICATION": false,
+  "GUIDE_PAGE": true,
+  "SolutionCallback": "TestCallback",
+  "OPTIONS": {
+    "POPULARCAPTCHA": {
+      "ENABLED": true,
+      "ALWAYSSOLVE": true,
+      "AUTOOPEN": true,
+      "AUTOSOLVE": true,
+      "ENGLISH": true,
+      "SOLVETIME": 5
+    },
+    "RECAPTCHA2": {
+      "ENABLED": true,
+      "ALWAYSSOLVE": true,
+      "AUTOOPEN": true,
+      "AUTOSOLVE": true,
+      "METHOD": "RECOGNITION"
+    },
+    "AWSWAF": {
+      "ENABLED": true,
+      "AUTOOPEN": true,
+      "AUTOSOLVE": true
+    },
+    "BLS": {
+      "ENABLED": true,
+      "AUTOOPEN": false,
+      "AUTOSOLVE": true
+    },
+    "GEETEST": {
+      "ENABLED": true,
+      "AUTOOPEN": true,
+      "AUTOSOLVE": true,
+      "SOLVETIME": 5
+    },
+    "MTCAPTCHA": {
+      "ENABLED": true,
+      "AUTOSOLVE": true,
+      "METHOD": "RECOGNITION"
+    },
+    "PROSOPO": {
+      "ENABLED": true,
+      "ALWAYSSOLVE": true,
+      "AUTOOPEN": true,
+      "AUTOSOLVE": true
+    },
+    "TIKTOK": {
+      "ENABLED": true,
+      "ALWAYSSOLVE": true,
+      "AUTOSOLVE": true
+    },
+    "CAPTCHAFOX": {
+      "ENABLED": true,
+      "AUTOOPEN": true,
+      "ALWAYSSOLVE": true,
+      "AUTOSOLVE": true
+    },
+    "BINANCE": {
+      "ENABLED": true,
+      "ALWAYSSOLVE": true,
+      "AUTOSOLVE": true
+    },
+    "SLIDE": {
+      "ENABLED": true,
+      "AUTOOPEN": true,
+      "ALWAYSSOLVE": true,
+      "AUTOSOLVE": true
+    },
+    "TENCENT": {
+      "ENABLED": true,
+      "AUTOOPEN": true,
+      "ALWAYSSOLVE": true,
+      "AUTOSOLVE": true
+    }
+  },
+  "site_configs": {
+    "last_updated": "2025-11-08",
+    "configs": [
+      {
+        "websiteUrl": "https://www.geetest.com/",
+        "frameSelector": ".geetest_freeze_wait",
+        "selectors": {
+          "bgImg": ".geetest_bg",
+          "puzzleImg": ".geetest_slice_bg",
+          "dragBtn": ".geetest_btn",
+          "refreshBtn": ".geetest_refresh"
+        },
+        "question": "Please solve the captcha"
+      },
+      {
+        "websiteUrl": "https://open-us.vnnox.com/",
+        "frameSelector": ".window-show",
+        "selectors": {
+          "bgImg": "#aliyunCaptcha-img",
+          "puzzleImg": "#aliyunCaptcha-puzzle",
+          "dragBtn": "#aliyunCaptcha-sliding-slider",
+          "refreshBtn": "#aliyunCaptcha-btn-refresh"
+        },
+        "question": "#aliyunCaptcha-title"
+      },
+      {
+        "websiteUrl": "https://2captcha.com/demo/geetest-v4",
+        "frameSelector": ".geetest_freeze_wait",
+        "selectors": {
+          "bgImg": ".geetest_bg",
+          "puzzleImg": ".geetest_slice_bg",
+          "dragBtn": ".geetest_btn",
+          "refreshBtn": ".geetest_refresh"
+        },
+        "question": ".geetest_text_tips"
+      },
+      {
+        "websiteUrl": "https://app.ipfoxy.com",
+        "frameSelector": ".window-show",
+        "selectors": {
+          "bgImg": "#aliyunCaptcha-img",
+          "puzzleImg": "#aliyunCaptcha-puzzle",
+          "dragBtn": "#aliyunCaptcha-sliding-slider",
+          "refreshBtn": "#aliyunCaptcha-btn-refresh"
+        },
+        "question": "#aliyunCaptcha-title"
+      }
+    ]
+  }
+}

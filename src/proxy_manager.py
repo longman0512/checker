@@ -37,7 +37,7 @@ class ProxyManager:
         self._rotate_every: int = 1         # rotate after N uses
         self._current_idx: int = 0          # index in _proxies
         self._use_count: int = 0            # uses since last rotation
-        self._enabled: bool = True
+        self._enabled: bool = False
 
     # ── Configuration ─────────────────────────────────────────────────
 
